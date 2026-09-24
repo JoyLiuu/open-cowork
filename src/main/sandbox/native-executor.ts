@@ -10,6 +10,11 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { log } from '../utils/logger';
+import {
+  createWindowsOutputNormalizer,
+  getWindowsConsoleCodePage,
+  type OutputNormalizer,
+} from '../utils/windows-output-encoding';
 import { isPathWithinRoot } from '../tools/path-containment';
 import type { SandboxConfig, SandboxExecutor, ExecutionResult, DirectoryEntry } from './types';
 
@@ -126,6 +131,9 @@ export class NativeExecutor implements SandboxExecutor {
     const workDir = cwd ? this.validatePath(cwd) : this.workspacePath;
     this.validateCommand(command, workDir);
 
+    const normalizeOutput: OutputNormalizer | null =
+      createWindowsOutputNormalizer(await getWindowsConsoleCodePage());
+
     return new Promise((resolve) => {
       const isWindows = process.platform === 'win32';
       const shell = isWindows ? 'powershell.exe' : '/bin/bash';
@@ -170,11 +178,11 @@ export class NativeExecutor implements SandboxExecutor {
       let stderr = '';
 
       proc.stdout?.on('data', (data: Buffer) => {
-        stdout += data.toString();
+        stdout += (normalizeOutput ? normalizeOutput(data) : data).toString();
       });
 
       proc.stderr?.on('data', (data: Buffer) => {
-        stderr += data.toString();
+        stderr += (normalizeOutput ? normalizeOutput(data) : data).toString();
       });
 
       proc.on('error', (error: Error) => {
