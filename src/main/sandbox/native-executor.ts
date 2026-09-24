@@ -131,8 +131,9 @@ export class NativeExecutor implements SandboxExecutor {
     const workDir = cwd ? this.validatePath(cwd) : this.workspacePath;
     this.validateCommand(command, workDir);
 
-    const normalizeOutput: OutputNormalizer | null =
-      createWindowsOutputNormalizer(await getWindowsConsoleCodePage());
+    const codePage = await getWindowsConsoleCodePage();
+    const normalizeStdout: OutputNormalizer | null = createWindowsOutputNormalizer(codePage);
+    const normalizeStderr: OutputNormalizer | null = createWindowsOutputNormalizer(codePage);
 
     return new Promise((resolve) => {
       const isWindows = process.platform === 'win32';
@@ -178,11 +179,11 @@ export class NativeExecutor implements SandboxExecutor {
       let stderr = '';
 
       proc.stdout?.on('data', (data: Buffer) => {
-        stdout += (normalizeOutput ? normalizeOutput(data) : data).toString();
+        stdout += (normalizeStdout ? normalizeStdout(data) : data).toString();
       });
 
       proc.stderr?.on('data', (data: Buffer) => {
-        stderr += (normalizeOutput ? normalizeOutput(data) : data).toString();
+        stderr += (normalizeStderr ? normalizeStderr(data) : data).toString();
       });
 
       proc.on('error', (error: Error) => {

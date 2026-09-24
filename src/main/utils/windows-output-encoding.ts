@@ -90,6 +90,23 @@ export async function getWindowsConsoleCodePage(): Promise<number | null> {
  */
 export type OutputNormalizer = (chunk: Buffer) => Buffer;
 
+/**
+ * A normalizer adaptively converts a non-UTF-8 codepage byte stream into
+ * UTF-8 by inspecting the bytes themselves instead of naming the producing
+ * shell.
+ *
+ * The returned closure is stateful (it buffers undecided tail bytes and
+ * remembers once it has switched to the OEM codepage), so it must be bound to
+ * a single logical byte stream. Callers that capture two streams — e.g.
+ * stdout and stderr — must create one instance per stream from the same
+ * code-page read.
+ *
+ * A trailing incomplete multi-byte sequence at the end of stream is
+ * intentionally not flushed: its encoding cannot be determined, and it only
+ * occurs when output is cut mid-character, in which case the surrounding
+ * output is corrupt anyway.
+ */
+
 interface Utf8Classification {
   /** Index of the first byte of an invalid UTF-8 sequence, or -1. */
   invalidAt: number;

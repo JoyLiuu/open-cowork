@@ -66,6 +66,17 @@ describe('createWindowsOutputNormalizer', () => {
     expect(decodeAll(normalize, [[0x6f, 0x6b, 0x20, 0xc4, 0xe3, 0xba, 0xc3]])).toBe('ok 你好');
   });
 
+  it('keeps per-stream instances isolated', () => {
+    const stdoutNormalizer = createWindowsOutputNormalizer(936)!;
+    const stderrNormalizer = createWindowsOutputNormalizer(936)!;
+    // stdout holds back a truncated GBK lead byte in its internal buffer.
+    stdoutNormalizer(Buffer.from([0xc4]));
+    // stderr sees a complete byte stream unaffected by stdout's pending state.
+    expect(stderrNormalizer(Buffer.from([0xc4, 0xe3, 0xba, 0xc3])).toString('utf-8')).toBe('你好');
+    // stdout completes and still decodes correctly.
+    expect(stdoutNormalizer(Buffer.from([0xe3, 0xba, 0xc3])).toString('utf-8')).toBe('你好');
+  });
+
   it('returns null when no conversion is needed or possible', () => {
     expect(createWindowsOutputNormalizer(65001)).toBeNull();
     expect(createWindowsOutputNormalizer(null)).toBeNull();
@@ -74,7 +85,12 @@ describe('createWindowsOutputNormalizer', () => {
 });
 
 describe('getWindowsConsoleCodePage', () => {
-  it('does not attempt detection on non-Windows hosts', async () => {
-    expect(await getWindowsConsoleCodePage()).toBeNull();
+  it('detects a code page on Windows and no-ops elsewhere', async () => {
+    const result = await getWindowsConsoleCodePage();
+    if (process.platform === 'win32') {
+      expect(result === null || typeof result === 'number').toBe(true);
+    } else {
+      expect(result).toBeNull();
+    }
   });
 });

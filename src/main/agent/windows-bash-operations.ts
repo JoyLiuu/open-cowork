@@ -151,9 +151,9 @@ export function createWindowsBashOperations(
       }
 
       const { shell, args } = buildWindowsShellInvocation(command, shellResolver(cwd));
-      const normalizeOutput: OutputNormalizer | null = createWindowsOutputNormalizer(
-        await getWindowsConsoleCodePage()
-      );
+      const codePage = await getWindowsConsoleCodePage();
+      const normalizeStdout: OutputNormalizer | null = createWindowsOutputNormalizer(codePage);
+      const normalizeStderr: OutputNormalizer | null = createWindowsOutputNormalizer(codePage);
 
       return new Promise((resolve, reject) => {
         const child = spawnProcess(shell, args, {
@@ -172,8 +172,8 @@ export function createWindowsBashOperations(
         const cleanup = () => {
           if (timeoutHandle) clearTimeout(timeoutHandle);
           if (forcedSettleHandle) clearTimeout(forcedSettleHandle);
-          child.stdout?.off('data', onDataChunk);
-          child.stderr?.off('data', onDataChunk);
+          child.stdout?.off('data', onStdoutChunk);
+          child.stderr?.off('data', onStderrChunk);
           child.off('close', onClose);
           child.off('error', onError);
           signal?.removeEventListener('abort', onAbort);
@@ -232,11 +232,14 @@ export function createWindowsBashOperations(
           terminateChild('aborted');
         }
 
-        const onDataChunk = (chunk: Buffer) => {
-          onData(normalizeOutput ? normalizeOutput(chunk) : chunk);
+        const onStdoutChunk = (chunk: Buffer) => {
+          onData(normalizeStdout ? normalizeStdout(chunk) : chunk);
         };
-        child.stdout?.on('data', onDataChunk);
-        child.stderr?.on('data', onDataChunk);
+        const onStderrChunk = (chunk: Buffer) => {
+          onData(normalizeStderr ? normalizeStderr(chunk) : chunk);
+        };
+        child.stdout?.on('data', onStdoutChunk);
+        child.stderr?.on('data', onStderrChunk);
         child.once('close', onClose);
         child.once('error', onError);
 
