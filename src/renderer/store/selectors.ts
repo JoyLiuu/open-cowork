@@ -22,8 +22,10 @@ import type { GlobalNotice, SessionExecutionClock, CompactionEvent } from './ind
 // Stable empty fallbacks. Returning a fresh `[]` from a selector makes
 // useSyncExternalStore see a new snapshot on every read, which re-renders in an
 // infinite loop until React throws "Maximum update depth exceeded".
-const EMPTY_MESSAGES: Message[] = [];
-const EMPTY_TRACE_STEPS: TraceStep[] = [];
+// Treat them as read-only: the store always replaces arrays wholesale.
+// Only the two consumed by component-level selectors are exported.
+export const EMPTY_MESSAGES: Message[] = [];
+export const EMPTY_TRACE_STEPS: TraceStep[] = [];
 const EMPTY_PENDING_TURNS: string[] = [];
 const EMPTY_COMPACTION_HISTORY: CompactionEvent[] = [];
 
