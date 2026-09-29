@@ -100,7 +100,8 @@ function emitSubagentFailure(
   parentSessionId: string,
   subagentId: string,
   task: string,
-  message: string
+  message: string,
+  startTime: number
 ): void {
   const truncated = message.slice(0, 200);
   safeSendEvent(
@@ -118,6 +119,7 @@ function emitSubagentFailure(
     tools: [],
     accumulatedText: '',
     error: truncated,
+    durationMs: Date.now() - startTime,
   });
 }
 
@@ -308,7 +310,8 @@ function createSpawnSubagentTool(
             parentSessionId,
             subagentId,
             task,
-            'could not resolve model for subagent'
+            'could not resolve model for subagent',
+            startTime
           );
           return {
             content: [
