@@ -340,7 +340,7 @@ export function SettingsMemory() {
       await Promise.all([refreshOverview(), refreshFiles()]);
       setStatus(t('memory.forgetSessionSuccess'));
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
+      setStatus(stripIpcErrorPrefix(error instanceof Error ? error.message : String(error)));
     } finally {
       setIsBusy(false);
     }
