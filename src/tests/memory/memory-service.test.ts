@@ -209,7 +209,11 @@ function createDatabaseInstance(db: Database.Database): DatabaseInstance {
     raw: db,
     sessions: {
       create: vi.fn(),
-      update: vi.fn(),
+      update: vi.fn((id: string, updates: Partial<SessionRow>) => {
+        for (const [column, value] of Object.entries(updates)) {
+          db.prepare(`UPDATE sessions SET ${column} = ? WHERE id = ?`).run(value, id);
+        }
+      }),
       get: vi.fn(
         (id: string) =>
           db.prepare('SELECT * FROM sessions WHERE id = ? LIMIT 1').get(id) as
@@ -678,6 +682,100 @@ describe('MemoryService', () => {
       service.search({ query: 'gateway token rotation', scope: 'all', limit: 10 })
     ).toHaveLength(0);
   });
+
+  it('forgets a conversation and does not learn from it again', async () => {
+    const gatewayTurns = [
+      { role: 'user' as const, text: '继续处理 gateway token rotation。', timestamp: 1 },
+      { role: 'assistant' as const, text: '已经完成 gateway token rotation。', timestamp: 2 },
+    ];
+    insertSession(rawDb, { id: 'session-a', title: 'Gateway fixes', cwd: '/repo/a' });
+    insertSession(rawDb, { id: 'session-b', title: 'Preferences', cwd: '/repo/a' });
+    gatewayTurns.forEach((turn, index) =>
+      insertMessage(rawDb, { id: `a${index}`, sessionId: 'session-a', ...turn })
+    );
+    insertMessage(rawDb, {
+      id: 'b0',
+      sessionId: 'session-b',
+      role: 'user',
+      text: '请用中文回答。',
+      timestamp: 3,
+    });
+    await service.rebuildAll();
+    expect(service.inspectSession('session-a')).not.toBeNull();
+
+    await service.forgetSession('session-a');
+
+    const forgotten = () => {
+      expect(service.inspectSession('session-a')).toBeNull();
+      expect(
+        service.search({ query: 'gateway token rotation', scope: 'all', limit: 10 })
+      ).toHaveLength(0);
+    };
+    forgotten();
+    expect(db.sessions.get('session-a')?.memory_enabled).toBe(0);
+    expect(service.inspectSession('session-b')).not.toBeNull();
+
+    // A run that started before forgetting still carries memoryEnabled: true.
+    await service.enqueueIngestion({
+      session: makeSession('session-a', 'Gateway fixes', '/repo/a'),
+      prompt: 'gateway token rotation',
+      messages: makeMessages('session-a', [
+        ...gatewayTurns,
+        { role: 'user', text: '再检查一次 gateway token rotation。', timestamp: 4 },
+      ]),
+    });
+    forgotten();
+
+    const rebuilt = await service.rebuildAll();
+    expect(rebuilt.sessionCount).toBe(1);
+    forgotten();
+    expect(service.inspectSession('session-b')).not.toBeNull();
+  });
+
+  it.each([
+    ['extracting its experience memory', 'experience memory extraction system'],
+    ['updating core memory from it', 'Memory Profiler'],
+  ])(
+    'forgets a conversation while a rebuild is %s',
+    async (_step: string, blockedPrompt: string) => {
+      insertSession(rawDb, { id: 'session-a', title: 'Gateway fixes', cwd: '/repo/a' });
+      insertMessage(rawDb, {
+        id: 'a0',
+        sessionId: 'session-a',
+        role: 'user',
+        text: '继续处理 gateway token rotation。',
+        timestamp: 1,
+      });
+
+      let release!: () => void;
+      const blockedLlm: MemoryLLMClientLike = {
+        async complete(request: MemoryCompletionRequest): Promise<{ text: string }> {
+          if (request.systemPrompt.includes(blockedPrompt)) {
+            await new Promise<void>((resolve) => {
+              release = resolve;
+            });
+          }
+          return new MockMemoryLLMClient().complete(request);
+        },
+        async embed(text: string): Promise<number[]> {
+          return new MockMemoryLLMClient().embed(text);
+        },
+      };
+      service = new MemoryService(db, { llmClient: blockedLlm });
+
+      const rebuild = service.rebuildAll();
+      await vi.waitFor(() => expect(typeof release).toBe('function'));
+      const forget = service.forgetSession('session-a');
+      release();
+      await rebuild;
+      await forget;
+
+      expect(service.inspectSession('session-a')).toBeNull();
+      expect(
+        service.search({ query: 'gateway token rotation', scope: 'all', limit: 10 })
+      ).toHaveLength(0);
+    }
+  );
 
   it('rejects reading files that escape the memory allowlist through symlinks', async () => {
     await service.enqueueIngestion({
