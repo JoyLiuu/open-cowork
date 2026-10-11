@@ -683,7 +683,8 @@ export class MemoryService {
       turns,
       existingCorePromptBlock: coreStore.toPromptBlock(),
     });
-    if (actions.length) {
+    // The conversation can be forgotten while the extractor runs.
+    if (actions.length && !this.isMemoryTurnedOff(sessionId)) {
       coreStore.applyActions(actions);
     }
   }

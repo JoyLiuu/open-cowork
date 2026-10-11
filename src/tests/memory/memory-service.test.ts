@@ -743,7 +743,7 @@ describe('MemoryService', () => {
         id: 'a0',
         sessionId: 'session-a',
         role: 'user',
-        text: '继续处理 gateway token rotation。',
+        text: '请用中文继续处理 gateway token rotation。',
         timestamp: 1,
       });
 
@@ -774,6 +774,7 @@ describe('MemoryService', () => {
       expect(
         service.search({ query: 'gateway token rotation', scope: 'all', limit: 10 })
       ).toHaveLength(0);
+      expect(service.getCoreEntries()).toEqual([]);
     }
   );
 

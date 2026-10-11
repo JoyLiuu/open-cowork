@@ -834,14 +834,16 @@ export function SettingsMemory() {
                   </p>
                   {inspectedSession && (
                     <div className="flex gap-2">
-                      <button
-                        onClick={() => {
-                          void window.electronAPI.showItemInFolder(inspectedSession.filePath);
-                        }}
-                        className="rounded-lg border border-border bg-background px-3 py-2 text-xs font-medium text-text-primary"
-                      >
-                        {t('memory.revealInFinder', '在 Finder 中显示')}
-                      </button>
+                      {inspectedSession.filePath && (
+                        <button
+                          onClick={() => {
+                            void window.electronAPI.showItemInFolder(inspectedSession.filePath);
+                          }}
+                          className="rounded-lg border border-border bg-background px-3 py-2 text-xs font-medium text-text-primary"
+                        >
+                          {t('memory.revealInFinder', '在 Finder 中显示')}
+                        </button>
+                      )}
                       <button
                         onClick={() => {
                           void handleForgetSession(inspectedSession.session.sessionId);
