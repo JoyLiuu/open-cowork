@@ -51,5 +51,5 @@
 
 ---
 
-_Last updated: 2026-05-01_
+_Last updated: 2026-10-14_
 _Want to contribute? Check our [Contributing Guide](CONTRIBUTING.md) and pick an issue labeled `good first issue`._
