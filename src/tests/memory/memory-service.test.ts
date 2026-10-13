@@ -778,6 +778,121 @@ describe('MemoryService', () => {
     }
   );
 
+  // Live ingestion updates core memory first and then extracts experience memory. A core fact applied
+  // before the conversation is forgotten stays, since core memory is outside this operation; one that
+  // is still being extracted when the conversation is forgotten is not applied.
+  it.each([
+    ['extracting its experience memory', 'experience memory extraction system', ['Jack', '中文']],
+    ['updating core memory from it', 'Memory Profiler', ['Jack']],
+  ])(
+    'forgets a conversation while live ingestion is %s',
+    async (_step: string, blockedPrompt: string, coreValues: string[]) => {
+      insertSession(rawDb, { id: 'session-a', title: 'Gateway fixes', cwd: '/repo/a' });
+      insertSession(rawDb, { id: 'session-b', title: 'Introductions', cwd: '/repo/b' });
+      await service.enqueueIngestion({
+        session: makeSession('session-b', 'Introductions', '/repo/b'),
+        prompt: '介绍',
+        messages: makeMessages('session-b', [
+          { role: 'user', text: '你好，我是 Jack。', timestamp: 1 },
+          { role: 'assistant', text: '你好 Jack。', timestamp: 2 },
+        ]),
+      });
+
+      let release!: () => void;
+      const blockedLlm: MemoryLLMClientLike = {
+        async complete(request: MemoryCompletionRequest): Promise<{ text: string }> {
+          if (request.systemPrompt.includes(blockedPrompt)) {
+            await new Promise<void>((resolve) => {
+              release = resolve;
+            });
+          }
+          return new MockMemoryLLMClient().complete(request);
+        },
+        async embed(text: string): Promise<number[]> {
+          return new MockMemoryLLMClient().embed(text);
+        },
+      };
+      service = new MemoryService(db, { llmClient: blockedLlm });
+
+      // The run started while memory was on for the conversation, so it carries memoryEnabled: true.
+      const ingestion = service.enqueueIngestion({
+        session: makeSession('session-a', 'Gateway fixes', '/repo/a'),
+        prompt: 'gateway token rotation',
+        messages: makeMessages('session-a', [
+          { role: 'user', text: '请用中文继续处理 gateway token rotation。', timestamp: 1 },
+          { role: 'assistant', text: '已经完成 gateway token rotation。', timestamp: 2 },
+        ]),
+      });
+      await vi.waitFor(() => expect(typeof release).toBe('function'));
+      const forget = service.forgetSession('session-a');
+      release();
+      await ingestion;
+      await forget;
+
+      expect(service.inspectSession('session-a')).toBeNull();
+      expect(
+        service.search({ query: 'gateway token rotation', scope: 'all', limit: 10 })
+      ).toHaveLength(0);
+      expect(service.getCoreEntries().map((entry) => entry.value)).toEqual(coreValues);
+      const { storageRoot: memoryRoot } = service.getOverview();
+      for (const file of ['experience_memory.json', 'session_state.json']) {
+        expect(fs.readFileSync(path.join(memoryRoot, file), 'utf8')).not.toContain('session-a');
+      }
+      expect(service.inspectSession('session-b')).not.toBeNull();
+    }
+  );
+
+  it('keeps a conversation forgotten across a restart, the global toggle and rebuilds', async () => {
+    insertSession(rawDb, { id: 'session-a', title: 'Gateway fixes', cwd: '/repo/a' });
+    insertSession(rawDb, { id: 'session-b', title: 'Preferences', cwd: '/repo/a' });
+    const gatewayTurns = [
+      { role: 'user' as const, text: '继续处理 gateway token rotation。', timestamp: 1 },
+      { role: 'assistant' as const, text: '已经完成 gateway token rotation。', timestamp: 2 },
+    ];
+    gatewayTurns.forEach((turn, index) =>
+      insertMessage(rawDb, { id: `a${index}`, sessionId: 'session-a', ...turn })
+    );
+    insertMessage(rawDb, {
+      id: 'b0',
+      sessionId: 'session-b',
+      role: 'user',
+      text: '请用中文回答。',
+      timestamp: 3,
+    });
+    await service.rebuildAll();
+    await service.forgetSession('session-a');
+
+    const stillForgotten = () => {
+      expect(service.inspectSession('session-a')).toBeNull();
+      expect(
+        service.search({ query: 'gateway token rotation', scope: 'all', limit: 10 })
+      ).toHaveLength(0);
+      expect(db.sessions.get('session-a')?.memory_enabled).toBe(0);
+      expect(service.inspectSession('session-b')).not.toBeNull();
+    };
+    stillForgotten();
+
+    // A restart: a new service on the same database and memory files.
+    service = new MemoryService(db, { llmClient: new MockMemoryLLMClient() });
+    stillForgotten();
+
+    // The global toggle changes configuration only, whichever way it goes.
+    for (const memoryEnabled of [false, true]) {
+      configStore.update({ memoryEnabled });
+      await service.enqueueIngestion({
+        session: makeSession('session-a', 'Gateway fixes', '/repo/a'),
+        prompt: 'gateway token rotation',
+        messages: makeMessages('session-a', gatewayTurns),
+      });
+      stillForgotten();
+    }
+
+    await service.rebuildWorkspace('/repo/a');
+    stillForgotten();
+    await service.rebuildAll();
+    stillForgotten();
+  });
+
   it('rejects reading files that escape the memory allowlist through symlinks', async () => {
     await service.enqueueIngestion({
       session: makeSession('session-a', 'Gateway fixes', '/repo/a'),
