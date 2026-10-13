@@ -127,6 +127,19 @@ describe('a TodoWrite call in the saved conversation', () => {
     expect(markup).toContain('width:33.33');
   });
 
+  it('names the item in progress by its content when it has no activeForm', () => {
+    const block: ToolUseContent = {
+      ...toolUse,
+      input: { todos: [{ content: 'Fix the bug', status: 'in_progress' }] },
+    };
+
+    const markup = renderToStaticMarkup(createElement(TodoWriteBlock, { block }));
+
+    // Once in the header, once in the list.
+    expect(markup.split('Fix the bug')).toHaveLength(3);
+    expect(markup).not.toContain('undefined');
+  });
+
   it('is shown by ToolUseBlock for the exact name TodoWrite', () => {
     const markup = renderToStaticMarkup(createElement(ToolUseBlock, { block: toolUse }));
 

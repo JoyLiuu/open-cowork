@@ -309,6 +309,33 @@ describe('permission-rules-store', () => {
       expect(decidePermission(SESSION_A, 'bash', {})).toBe('allow');
     });
 
+    it('keep the approvals when the rules differ only in tool name case or an empty pattern', () => {
+      setPermissionRules([
+        { tool: 'Bash', action: 'ask' },
+        { tool: 'read', pattern: '', action: 'allow' },
+      ]);
+      rememberAlwaysAllow(SESSION_A, 'bash');
+
+      setPermissionRules([
+        { tool: 'bash', action: 'ask' },
+        { tool: 'read', action: 'allow' },
+      ]);
+
+      expect(decidePermission(SESSION_A, 'bash', { command: 'ls' })).toBe('allow');
+    });
+
+    it('drop the approvals when the order of the rules changes, since the first match wins', () => {
+      const sudoDenied = { tool: 'bash', pattern: '*sudo*', action: 'deny' } as const;
+      const otherwiseAsk = { tool: 'bash', action: 'ask' } as const;
+      setPermissionRules([sudoDenied, otherwiseAsk]);
+      expect(decidePermission(SESSION_A, 'bash', { command: 'sudo ls' })).toBe('deny');
+      rememberAlwaysAllow(SESSION_A, 'bash');
+
+      setPermissionRules([otherwiseAsk, sudoDenied]);
+
+      expect(decidePermission(SESSION_A, 'bash', { command: 'sudo ls' })).toBe('ask');
+    });
+
     it('drop the approvals when invalid input resets the rules to the defaults', () => {
       setPermissionRules([{ tool: 'bash', action: 'allow' }]);
       rememberAlwaysAllow(SESSION_A, 'write');

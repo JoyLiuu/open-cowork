@@ -67,11 +67,26 @@ function sanitizeRules(input: unknown): PermissionRule[] | null {
   return out;
 }
 
+/**
+ * What decides a call, for comparing two rule lists. The first matching rule wins, so the order
+ * is part of the policy and stays. As in decidePermission, tool names compare case-insensitively
+ * and an empty pattern is no pattern.
+ */
+function rulesSignature(list: PermissionRule[]): string {
+  return JSON.stringify(
+    list.map((rule) => ({
+      tool: rule.tool.toLowerCase(),
+      pattern: rule.pattern ?? '',
+      action: rule.action,
+    }))
+  );
+}
+
 export function setPermissionRules(next: unknown): void {
   const sanitized = sanitizeRules(next);
   const nextRules = sanitized && sanitized.length > 0 ? sanitized : [...DEFAULT_RULES];
   // An approval given under the old rules does not outlive a change to them: the user's rules decide.
-  if (JSON.stringify(nextRules) !== JSON.stringify(rules)) {
+  if (rulesSignature(nextRules) !== rulesSignature(rules)) {
     alwaysAllowBySession.clear();
   }
   rules = nextRules;
