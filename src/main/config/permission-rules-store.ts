@@ -63,7 +63,12 @@ function sanitizeRules(input: unknown): PermissionRule[] | null {
 
 export function setPermissionRules(next: unknown): void {
   const sanitized = sanitizeRules(next);
-  rules = sanitized && sanitized.length > 0 ? sanitized : [...DEFAULT_RULES];
+  const nextRules = sanitized && sanitized.length > 0 ? sanitized : [...DEFAULT_RULES];
+  // An approval given under the old rules does not outlive a change to them: the user's rules decide.
+  if (JSON.stringify(nextRules) !== JSON.stringify(rules)) {
+    alwaysAllowBySession.clear();
+  }
+  rules = nextRules;
 }
 
 export function getPermissionRules(): PermissionRule[] {

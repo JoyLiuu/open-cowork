@@ -249,4 +249,37 @@ describe('permission-rules-store', () => {
       expect(decidePermission(SESSION_A, 'bash', {})).toBe('allow');
     });
   });
+
+  describe('changes to the rules', () => {
+    it('drop the approvals given under the old rules, in every session', () => {
+      setPermissionRules([{ tool: 'bash', action: 'ask' }]);
+      rememberAlwaysAllow(SESSION_A, 'bash');
+      rememberAlwaysAllow(SESSION_B, 'bash');
+      expect(decidePermission(SESSION_A, 'bash', {})).toBe('allow');
+
+      setPermissionRules([{ tool: 'bash', action: 'deny' }]);
+
+      expect(decidePermission(SESSION_A, 'bash', {})).toBe('deny');
+      expect(decidePermission(SESSION_B, 'bash', {})).toBe('deny');
+    });
+
+    it('keep the approvals when the same rules are sent again', () => {
+      setPermissionRules([{ tool: 'bash', action: 'ask' }]);
+      rememberAlwaysAllow(SESSION_A, 'bash');
+
+      // The renderer mirrors its settings to the main process more often than the rules change.
+      setPermissionRules([{ tool: 'bash', action: 'ask' }]);
+
+      expect(decidePermission(SESSION_A, 'bash', {})).toBe('allow');
+    });
+
+    it('drop the approvals when invalid input resets the rules to the defaults', () => {
+      setPermissionRules([{ tool: 'bash', action: 'allow' }]);
+      rememberAlwaysAllow(SESSION_A, 'write');
+
+      setPermissionRules(null);
+
+      expect(decidePermission(SESSION_A, 'write', {})).toBe('ask');
+    });
+  });
 });
