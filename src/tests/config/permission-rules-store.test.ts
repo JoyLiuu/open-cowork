@@ -270,6 +270,12 @@ describe('permission-rules-store', () => {
       expect(decidePermission(SESSION_A, 'TodoWrite', { todos: [] })).toBe(action);
     });
 
+    it('matches the exact name only', () => {
+      for (const name of ['todo', 'todowrite_v2', 'mcp__notes__TodoWrite', 'TodoRead']) {
+        expect(decidePermission(SESSION_A, name, {})).toBe('ask');
+      }
+    });
+
     it('does not make other tools without a rule allowed', () => {
       expect(decidePermission(SESSION_A, 'WebFetch', {})).toBe('ask');
       expect(decidePermission(SESSION_A, 'config_write', {})).toBe('ask');
@@ -322,6 +328,16 @@ describe('permission-rules-store', () => {
       ]);
 
       expect(decidePermission(SESSION_A, 'bash', { command: 'ls' })).toBe('allow');
+    });
+
+    it('drop the approvals when a non-empty pattern changes', () => {
+      setPermissionRules([{ tool: 'bash', pattern: '*sudo*', action: 'deny' }]);
+      rememberAlwaysAllow(SESSION_A, 'bash');
+      expect(decidePermission(SESSION_A, 'bash', { command: 'ls' })).toBe('allow');
+
+      setPermissionRules([{ tool: 'bash', pattern: '*rm*', action: 'deny' }]);
+
+      expect(decidePermission(SESSION_A, 'bash', { command: 'ls' })).toBe('ask');
     });
 
     it('drop the approvals when the order of the rules changes, since the first match wins', () => {

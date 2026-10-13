@@ -6,7 +6,10 @@
  *   - The tool's arguments are validated by pi's own validator, as in a real run: the four statuses
  *     and the optional id / activeForm pass, an unknown status, empty content or a missing list fail
  *   - The tool keeps no state: the result describes only the list in the call
+ *   - Both startup paths in index.ts register the extension
  */
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { validateToolArguments } from '@mariozechner/pi-ai';
 import { TodoExtension } from '../../main/agent/todo-extension';
@@ -57,6 +60,17 @@ describe('TodoExtension', () => {
   ])('rejects %s', async (_name: string, args: unknown) => {
     const tool = await loadTool();
     expect(() => validate(tool, args)).toThrow(/Validation failed for tool "TodoWrite"/);
+  });
+
+  it('is registered in every extension manager the startup script builds', () => {
+    // The interactive and the headless startup paths each build their own manager.
+    const source = readFileSync(path.resolve(__dirname, '../../main/index.ts'), 'utf8');
+    const managers = [...source.matchAll(/new AgentRuntimeExtensionManager\(\[([\s\S]*?)\]\)/g)];
+
+    expect(managers).toHaveLength(2);
+    for (const [, extensions] of managers) {
+      expect(extensions).toContain('new TodoExtension()');
+    }
   });
 
   it('reports only the list in the call, and keeps nothing between calls', async () => {
