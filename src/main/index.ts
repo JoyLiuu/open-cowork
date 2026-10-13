@@ -1331,6 +1331,15 @@ app
 
     // Initialize database
     const db = initDatabase();
+    // A run does not outlive its process, and a packaged build holds the single-instance lock,
+    // so a session still marked running at this point was left by an earlier launch.
+    const interruptedSessions = db.sessions.markRunningIdle();
+    if (interruptedSessions > 0) {
+      log(
+        '[App] Marked sessions left running by the previous launch as idle:',
+        interruptedSessions
+      );
+    }
 
     pluginRuntimeService = new PluginRuntimeService(new PluginCatalogService());
     memoryService = new MemoryService(db);
