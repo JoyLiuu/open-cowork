@@ -250,6 +250,32 @@ describe('permission-rules-store', () => {
     });
   });
 
+  describe('TodoWrite', () => {
+    it('is allowed by default, whatever the case of the name', () => {
+      expect(decidePermission(SESSION_A, 'TodoWrite', { todos: [] })).toBe('allow');
+      expect(decidePermission(SESSION_A, 'todowrite', { todos: [] })).toBe('allow');
+    });
+
+    it('is allowed under saved settings that predate it', () => {
+      setPermissionRules([
+        { tool: 'read', action: 'allow' },
+        { tool: 'bash', action: 'ask' },
+        { tool: 'write', action: 'deny' },
+      ]);
+      expect(decidePermission(SESSION_A, 'TodoWrite', { todos: [] })).toBe('allow');
+    });
+
+    it.each(['ask', 'deny'] as const)('follows a rule that says %s', (action) => {
+      setPermissionRules([{ tool: 'TodoWrite', action }]);
+      expect(decidePermission(SESSION_A, 'TodoWrite', { todos: [] })).toBe(action);
+    });
+
+    it('does not make other tools without a rule allowed', () => {
+      expect(decidePermission(SESSION_A, 'WebFetch', {})).toBe('ask');
+      expect(decidePermission(SESSION_A, 'config_write', {})).toBe('ask');
+    });
+  });
+
   describe('changes to the rules', () => {
     it('drop the approvals given under the old rules, in every session', () => {
       setPermissionRules([{ tool: 'bash', action: 'ask' }]);
@@ -261,6 +287,16 @@ describe('permission-rules-store', () => {
 
       expect(decidePermission(SESSION_A, 'bash', {})).toBe('deny');
       expect(decidePermission(SESSION_B, 'bash', {})).toBe('deny');
+    });
+
+    it('let a rule that now asks override an earlier "always allow" for TodoWrite', () => {
+      setPermissionRules([{ tool: 'TodoWrite', action: 'ask' }]);
+      rememberAlwaysAllow(SESSION_A, 'TodoWrite');
+      expect(decidePermission(SESSION_A, 'TodoWrite', {})).toBe('allow');
+
+      setPermissionRules([{ tool: 'TodoWrite', action: 'deny' }]);
+
+      expect(decidePermission(SESSION_A, 'TodoWrite', {})).toBe('deny');
     });
 
     it('keep the approvals when the same rules are sent again', () => {

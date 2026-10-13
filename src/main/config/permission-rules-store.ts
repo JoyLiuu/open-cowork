@@ -29,6 +29,12 @@ const DEFAULT_RULES: PermissionRule[] = [
 
 const VALID_ACTIONS: ReadonlySet<PermissionRule['action']> = new Set(['allow', 'deny', 'ask']);
 
+/**
+ * Tools that read and write nothing outside the conversation. They are allowed when no rule
+ * names them, so settings saved before a tool existed still allow it. A rule for the tool wins.
+ */
+const ALLOW_WITHOUT_RULE: ReadonlySet<string> = new Set(['todowrite']);
+
 let rules: PermissionRule[] = [...DEFAULT_RULES];
 
 /** Session-scoped "always allow" decisions, keyed by sessionId → set of lowercase tool names. */
@@ -84,7 +90,8 @@ export function getPermissionRules(): PermissionRule[] {
  *   2. First rule whose `tool` matches (case-insensitive) AND whose
  *      optional `pattern` (glob-ish: `*` = any substring) matches the
  *      stringified input
- *   3. Default: 'ask' for unknown tools (conservative)
+ *   3. Default: 'allow' for tools that touch no file, process or network (ALLOW_WITHOUT_RULE),
+ *      'ask' for everything else (conservative)
  *
  * Defence-in-depth: even though `setPermissionRules` sanitizes input, we
  * re-validate the matched rule's action here so a malformed rule that
@@ -108,7 +115,7 @@ export function decidePermission(
     if (rule.pattern && !matchesPattern(rule.pattern, inputStr)) continue;
     return VALID_ACTIONS.has(rule.action) ? rule.action : 'ask';
   }
-  return 'ask';
+  return ALLOW_WITHOUT_RULE.has(lowered) ? 'allow' : 'ask';
 }
 
 export function rememberAlwaysAllow(sessionId: string, toolName: string): void {
