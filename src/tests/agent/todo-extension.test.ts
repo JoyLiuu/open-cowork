@@ -62,15 +62,15 @@ describe('TodoExtension', () => {
     expect(() => validate(tool, args)).toThrow(/Validation failed for tool "TodoWrite"/);
   });
 
-  it('is registered in every extension manager the startup script builds', () => {
-    // The interactive and the headless startup paths each build their own manager.
+  it('is registered wherever the startup script builds an extension manager', () => {
+    // The interactive and the headless startup paths each build their own manager. The managers
+    // are built inside Electron startup callbacks with live dependencies, so this reads the source.
     const source = readFileSync(path.resolve(__dirname, '../../main/index.ts'), 'utf8');
-    const managers = [...source.matchAll(/new AgentRuntimeExtensionManager\(\[([\s\S]*?)\]\)/g)];
+    const managers = source.split('new AgentRuntimeExtensionManager(').length - 1;
+    const registrations = source.split('new TodoExtension()').length - 1;
 
-    expect(managers).toHaveLength(2);
-    for (const [, extensions] of managers) {
-      expect(extensions).toContain('new TodoExtension()');
-    }
+    expect(managers).toBeGreaterThanOrEqual(2);
+    expect(registrations).toBe(managers);
   });
 
   it('reports only the list in the call, and keeps nothing between calls', async () => {

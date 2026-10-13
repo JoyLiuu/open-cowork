@@ -140,6 +140,28 @@ describe('a TodoWrite call in the saved conversation', () => {
     expect(markup).not.toContain('undefined');
   });
 
+  it('shows a cancelled item struck through and muted, and counts only completed items', () => {
+    const block: ToolUseContent = {
+      ...toolUse,
+      input: {
+        todos: [
+          { content: 'Read the config', status: 'completed' },
+          { content: 'Update the docs', status: 'cancelled' },
+        ],
+      },
+    };
+
+    const markup = renderToStaticMarkup(createElement(TodoWriteBlock, { block }));
+    const withoutCancelled = renderToStaticMarkup(
+      createElement(TodoWriteBlock, { block: toolUse })
+    );
+
+    expect(markup).toContain('Update the docs');
+    expect(markup).toContain('line-through opacity-60');
+    expect(markup).toContain('1/2');
+    expect(withoutCancelled).not.toContain('opacity-60');
+  });
+
   it('is shown by ToolUseBlock for the exact name TodoWrite', () => {
     const markup = renderToStaticMarkup(createElement(ToolUseBlock, { block: toolUse }));
 
