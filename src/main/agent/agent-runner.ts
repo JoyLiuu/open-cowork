@@ -48,6 +48,7 @@ import { getSandboxAdapter } from '../sandbox/sandbox-adapter';
 import { pathConverter } from '../sandbox/wsl-bridge';
 import { SandboxSync } from '../sandbox/sandbox-sync';
 import { extractArtifactsFromText, buildArtifactTraceSteps } from '../utils/artifact-parser';
+import { wrapReadToolForImageResizeErrors } from './image-resize-packaging';
 import { getDefaultShell } from '../utils/shell-resolver';
 import { PluginRuntimeService } from '../skills/plugin-runtime-service';
 import type { SkillsAdapter } from '../skills/skills-adapter';
@@ -1801,6 +1802,7 @@ ${hints.join('\n')}
         modelBaseUrl: piModel.baseUrl,
         effectiveCwd,
         apiKey,
+        subagent: configStore.getAll().subagent,
       });
       const skillPaths = await this.resolveSkillPaths(session.id);
       const skillsSignature = JSON.stringify(skillPaths);
@@ -1841,6 +1843,7 @@ ${hints.join('\n')}
             prompt,
             existingMessages,
             isColdStart: !cachedSession,
+            sandboxIsolated: useSandboxIsolation,
           })
         : { promptPrefix: undefined, customTools: [] };
 
@@ -2146,19 +2149,20 @@ Tool routing:
       // SDK otherwise rebuilds host-local tools from cwd.
       const guestSandboxPath =
         useSandboxIsolation && sandbox.isLima && sandboxPath ? sandboxPath : null;
-      const codingTools = guestSandboxPath
-        ? createLimaSandboxCodingTools(guestSandboxPath)
-        : createCodingTools(
-            effectiveCwd,
-            process.platform === 'win32'
-              ? { bash: { operations: createWindowsBashOperations() } }
-              : undefined
-          );
+      // The guest read tool resizes images on the host like the local one, so both get the wrapper.
+      const codingTools = wrapReadToolForImageResizeErrors(
+        (guestSandboxPath
+          ? createLimaSandboxCodingTools(guestSandboxPath)
+          : createCodingTools(
+              effectiveCwd,
+              process.platform === 'win32'
+                ? { bash: { operations: createWindowsBashOperations() } }
+                : undefined
+            )) as ToolDefinition[]
+      );
 
       // Inject a default 120s timeout for bash commands when the model omits one
-      const withTimeout = CoworkAgentRunner.wrapBashToolWithDefaultTimeout(
-        codingTools as ToolDefinition[]
-      );
+      const withTimeout = CoworkAgentRunner.wrapBashToolWithDefaultTimeout(codingTools);
 
       // Wrap the bash tool to intercept sudo commands and request passwords
       // Note: wrapBashToolForSudo returns ToolDefinition[] (5-param execute) but
