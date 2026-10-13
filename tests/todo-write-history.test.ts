@@ -141,24 +141,24 @@ describe('a TodoWrite call in the saved conversation', () => {
   });
 
   it('shows a cancelled item struck through and muted, and counts only completed items', () => {
-    const block: ToolUseContent = {
-      ...toolUse,
-      input: {
-        todos: [
-          { content: 'Read the config', status: 'completed' },
-          { content: 'Update the docs', status: 'cancelled' },
-        ],
-      },
-    };
+    const items = [{ content: 'Read the config', status: 'completed' }];
+    const render = (todos: unknown[]) =>
+      renderToStaticMarkup(
+        createElement(TodoWriteBlock, { block: { ...toolUse, input: { todos } } })
+      );
+    const classesOf = (markup: string, text: string) =>
+      new RegExp(`class="([^"]*)">${text}<`).exec(markup)?.[1]?.split(' ');
+    const withCancelled = render([...items, { content: 'Update the docs', status: 'cancelled' }]);
+    const withoutCancelled = render(items);
 
-    const markup = renderToStaticMarkup(createElement(TodoWriteBlock, { block }));
-    const withoutCancelled = renderToStaticMarkup(
-      createElement(TodoWriteBlock, { block: toolUse })
+    expect(classesOf(withCancelled, 'Update the docs')).toEqual(
+      expect.arrayContaining(['line-through', 'opacity-60'])
     );
-
-    expect(markup).toContain('Update the docs');
-    expect(markup).toContain('line-through opacity-60');
-    expect(markup).toContain('1/2');
+    // A completed item is struck through too, but it is not muted like a cancelled one.
+    expect(classesOf(withCancelled, 'Read the config')).toContain('line-through');
+    expect(classesOf(withCancelled, 'Read the config')).not.toContain('opacity-60');
+    expect(withCancelled).toContain('1/2');
+    expect(withoutCancelled).toContain('1/1');
     expect(withoutCancelled).not.toContain('opacity-60');
   });
 

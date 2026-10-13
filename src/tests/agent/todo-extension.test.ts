@@ -6,9 +6,9 @@
  *   - The tool's arguments are validated by pi's own validator, as in a real run: the four statuses
  *     and the optional id / activeForm pass, an unknown status, empty content or a missing list fail
  *   - The tool keeps no state: the result describes only the list in the call
- *   - Both startup paths in index.ts register the extension
+ *   - Every extension manager the main process builds, interactive and headless, registers it
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { validateToolArguments } from '@mariozechner/pi-ai';
@@ -62,15 +62,18 @@ describe('TodoExtension', () => {
     expect(() => validate(tool, args)).toThrow(/Validation failed for tool "TodoWrite"/);
   });
 
-  it('is registered wherever the startup script builds an extension manager', () => {
-    // The interactive and the headless startup paths each build their own manager. The managers
-    // are built inside Electron startup callbacks with live dependencies, so this reads the source.
-    const source = readFileSync(path.resolve(__dirname, '../../main/index.ts'), 'utf8');
-    const managers = source.split('new AgentRuntimeExtensionManager(').length - 1;
-    const registrations = source.split('new TodoExtension()').length - 1;
+  it('is registered wherever the app builds an extension manager', () => {
+    // The managers are built inside Electron startup callbacks with live dependencies (the
+    // interactive and the headless path), so this counts in the source of the main process.
+    const mainDir = path.resolve(__dirname, '../../main');
+    const sources = readdirSync(mainDir, { recursive: true, encoding: 'utf8' })
+      .filter((file) => file.endsWith('.ts') && !file.endsWith('.d.ts'))
+      .map((file) => readFileSync(path.join(mainDir, file), 'utf8'));
+    const count = (text: string) =>
+      sources.reduce((total, source) => total + source.split(text).length - 1, 0);
 
-    expect(managers).toBeGreaterThanOrEqual(2);
-    expect(registrations).toBe(managers);
+    expect(count('new AgentRuntimeExtensionManager(')).toBeGreaterThanOrEqual(2);
+    expect(count('new TodoExtension()')).toBe(count('new AgentRuntimeExtensionManager('));
   });
 
   it('reports only the list in the call, and keeps nothing between calls', async () => {
