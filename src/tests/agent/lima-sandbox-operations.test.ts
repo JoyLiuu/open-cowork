@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import { WriteStream } from 'fs';
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { basename, dirname, join } from 'path';
 import { describe, expect, it, vi } from 'vitest';
@@ -373,7 +373,7 @@ describe('lima sandbox coding tools', () => {
         content: [{ type: 'text', text: 'guest hosts' }],
       });
       expect(scriptFrom(spawnProcess, 1)).toBe(
-        "test -e '/etc/hosts' || exit 44; test -r '/etc/hosts' || exit 45; head -c 4100 -- '/etc/hosts'"
+        "test -e '/etc/hosts' || exit 44; test ! -d '/etc/hosts' || exit 46; test -r '/etc/hosts' || exit 45; head -c 4100 -- '/etc/hosts'"
       );
     } finally {
       await rm(outputPath, { force: true });
@@ -451,7 +451,7 @@ describe('lima sandbox coding tools', () => {
         guestChecks[index].emit('close', 44);
         await expect(pending).rejects.toMatchObject({ code: 'ENOENT', path });
         expect(scriptFrom(secondSpawn, index + 1)).toBe(
-          `test -e '${path}' || exit 44; test -r '${path}' || exit 45; head -c 4100 -- '${path}'`
+          `test -e '${path}' || exit 44; test ! -d '${path}' || exit 46; test -r '${path}' || exit 45; head -c 4100 -- '${path}'`
         );
       }
     } finally {
@@ -695,8 +695,22 @@ describe('lima sandbox file tools', () => {
       message: expect.stringContaining('permission denied'),
     });
     expect(scriptFrom(spawnProcess, 0)).toBe(
-      `test -e '${SANDBOX}/private.txt' || exit 44; test -r '${SANDBOX}/private.txt' || exit 45; cat -- '${SANDBOX}/private.txt'`
+      `test -e '${SANDBOX}/private.txt' || exit 44; test ! -d '${SANDBOX}/private.txt' || exit 46; test -r '${SANDBOX}/private.txt' || exit 45; cat -- '${SANDBOX}/private.txt'`
     );
+  });
+
+  it('reports a guest directory as EISDIR when reading it', async () => {
+    const child = new FakeChildProcess();
+    const files = createLimaSandboxFileOperations(SANDBOX, {
+      spawnProcess: createSpawnMock([child]),
+    });
+    const pending = files.read.readFile('/workspace/folder');
+    child.emit('close', 46);
+    await expect(pending).rejects.toMatchObject({
+      code: 'EISDIR',
+      path: '/workspace/folder',
+      message: expect.stringContaining('illegal operation on a directory'),
+    });
   });
 
   it('starts no guest process for read access', async () => {
@@ -707,7 +721,7 @@ describe('lima sandbox file tools', () => {
   });
 
   it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
-    'maps unreadable and missing files to EACCES and ENOENT in a real shell',
+    'maps unreadable, missing and directory paths to error codes in a real shell',
     async () => {
       const root = await mkdtemp(join(tmpdir(), 'cowork-lima-read-'));
       const spawnProcess = (_command: string, args: string[], options: SpawnOptions) =>
@@ -716,6 +730,7 @@ describe('lima sandbox file tools', () => {
         await writeFile(join(root, 'open.txt'), 'ok');
         await writeFile(join(root, 'private.txt'), 'secret');
         await chmod(join(root, 'private.txt'), 0o000);
+        await mkdir(join(root, 'folder'));
         const files = createLimaSandboxFileOperations(root, { spawnProcess });
         await expect(files.read.readFile('/workspace/open.txt')).resolves.toEqual(
           Buffer.from('ok')
@@ -729,6 +744,11 @@ describe('lima sandbox file tools', () => {
           await expect(operation('/workspace/absent.txt')).rejects.toMatchObject({
             code: 'ENOENT',
             path: '/workspace/absent.txt',
+          });
+          await expect(operation('/workspace/folder')).rejects.toMatchObject({
+            code: 'EISDIR',
+            path: '/workspace/folder',
+            message: expect.not.stringContaining(root),
           });
         }
       } finally {
@@ -824,7 +844,7 @@ describe('lima sandbox file tools', () => {
         }),
         expect.objectContaining({ type: 'image', mimeType }),
       ]);
-      const guard = `test -e '${SANDBOX}/picture' || exit 44; test -r '${SANDBOX}/picture' || exit 45`;
+      const guard = `test -e '${SANDBOX}/picture' || exit 44; test ! -d '${SANDBOX}/picture' || exit 46; test -r '${SANDBOX}/picture' || exit 45`;
       expect(scriptFrom(spawnProcess, 0)).toBe(`${guard}; head -c 4100 -- '${SANDBOX}/picture'`);
       expect(scriptFrom(spawnProcess, 1)).toBe(`${guard}; cat -- '${SANDBOX}/picture'`);
       expect(spawnProcess).toHaveBeenCalledTimes(2);
@@ -879,7 +899,7 @@ describe('lima sandbox file tools', () => {
         text: expect.stringContaining('hello from sandbox'),
       }),
     ]);
-    const guard = `test -e '${SANDBOX}/notes.txt' || exit 44; test -r '${SANDBOX}/notes.txt' || exit 45`;
+    const guard = `test -e '${SANDBOX}/notes.txt' || exit 44; test ! -d '${SANDBOX}/notes.txt' || exit 46; test -r '${SANDBOX}/notes.txt' || exit 45`;
     expect(scriptFrom(spawnProcess, 0)).toBe(`${guard}; head -c 4100 -- '${SANDBOX}/notes.txt'`);
     expect(scriptFrom(spawnProcess, 1)).toBe(`${guard}; cat -- '${SANDBOX}/notes.txt'`);
     expect(spawnProcess).toHaveBeenCalledTimes(2);

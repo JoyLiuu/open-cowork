@@ -22,6 +22,7 @@ export const LIMA_SANDBOX_INSTANCE = 'claude-sandbox';
 const VIRTUAL_WORKSPACE_PATTERN = /(^|[\s'"`=;|&()<>])\/workspace(?=\/|$|[\s'"`;|&()<>])/g;
 const GUEST_FILE_MISSING_EXIT_CODE = 44;
 const GUEST_FILE_PERMISSION_EXIT_CODE = 45;
+const GUEST_FILE_IS_DIRECTORY_EXIT_CODE = 46;
 const IMAGE_SNIFF_BYTES = 4100;
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
@@ -328,6 +329,15 @@ async function runGuestOrThrow(
       path: checkedPath,
     });
   }
+  if (result.exitCode === GUEST_FILE_IS_DIRECTORY_EXIT_CODE && checkedPath !== undefined) {
+    throw Object.assign(
+      new Error(`EISDIR: illegal operation on a directory, read '${checkedPath}'`),
+      {
+        code: 'EISDIR',
+        path: checkedPath,
+      }
+    );
+  }
   if (result.exitCode !== 0) {
     const detail = result.stderr.toString().trim() || result.stdout.toString().trim();
     throw new Error(detail || `Lima command failed with code ${result.exitCode}`);
@@ -373,6 +383,7 @@ export function createLimaSandboxFileOperations(
       spawnProcess,
       instanceName,
       `test -e ${target} || exit ${GUEST_FILE_MISSING_EXIT_CODE}; ` +
+        `test ! -d ${target} || exit ${GUEST_FILE_IS_DIRECTORY_EXIT_CODE}; ` +
         `test -r ${target} || exit ${GUEST_FILE_PERMISSION_EXIT_CODE}; ${command} -- ${target}`,
       undefined,
       absolutePath
