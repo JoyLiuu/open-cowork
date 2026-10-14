@@ -84,11 +84,8 @@ import {
 } from './tool-result-utils';
 import { fetchOllamaModelInfo } from '../config/ollama-api';
 import { createWindowsBashOperations } from './windows-bash-operations';
-import { createLimaSandboxCodingTools } from './lima-sandbox-operations';
+import { createLimaSandboxCodingTools, VIRTUAL_WORKSPACE_PATH } from './lima-sandbox-operations';
 import { createCompactionExtensionFactory } from './compaction-extension';
-
-// Virtual workspace path shown to the model (hides real sandbox path)
-const VIRTUAL_WORKSPACE_PATH = '/workspace';
 
 /**
  * Estimate chars-per-token ratio based on content language.
