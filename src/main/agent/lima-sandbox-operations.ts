@@ -370,7 +370,8 @@ export function createLimaSandboxFileOperations(
       runGuestOrThrow(
         spawnProcess,
         instanceName,
-        `test -e '${guestPath(absolutePath)}' || exit ${GUEST_FILE_MISSING_EXIT_CODE}`,
+        `test -e '${guestPath(absolutePath)}' || exit ${GUEST_FILE_MISSING_EXIT_CODE}; ` +
+          `test -r '${guestPath(absolutePath)}' || exit ${GUEST_FILE_PERMISSION_EXIT_CODE}`,
         undefined,
         absolutePath
       ).then(() => undefined),

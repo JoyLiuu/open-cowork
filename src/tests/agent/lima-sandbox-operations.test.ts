@@ -1,11 +1,11 @@
 import { EventEmitter } from 'events';
 import { WriteStream } from 'fs';
-import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { basename, dirname, join } from 'path';
 import { describe, expect, it, vi } from 'vitest';
 import type { ChildProcess, SpawnOptions } from 'child_process';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import {
   createLocalBashOperations,
   createAgentSession,
@@ -374,7 +374,9 @@ describe('lima sandbox coding tools', () => {
       await expect(guestReading).resolves.toMatchObject({
         content: [{ type: 'text', text: 'guest hosts' }],
       });
-      expect(scriptFrom(spawnProcess, 1)).toBe("test -e '/etc/hosts' || exit 44");
+      expect(scriptFrom(spawnProcess, 1)).toBe(
+        "test -e '/etc/hosts' || exit 44; test -r '/etc/hosts' || exit 45"
+      );
     } finally {
       await rm(outputPath, { force: true });
     }
@@ -449,7 +451,9 @@ describe('lima sandbox coding tools', () => {
         const pending = read.execute(`blocked-${index}`, { path });
         guestChecks[index].emit('close', 44);
         await expect(pending).rejects.toMatchObject({ code: 'ENOENT', path });
-        expect(scriptFrom(secondSpawn, index + 1)).toBe(`test -e '${path}' || exit 44`);
+        expect(scriptFrom(secondSpawn, index + 1)).toBe(
+          `test -e '${path}' || exit 44; test -r '${path}' || exit 45`
+        );
       }
     } finally {
       await rm(firstPath, { force: true });
@@ -680,6 +684,48 @@ describe('lima sandbox file tools', () => {
     await expect(pending).rejects.toMatchObject({ code: 'ENOENT', path: '/workspace/missing.txt' });
   });
 
+  it('reports an unreadable guest file as EACCES before reading', async () => {
+    const child = new FakeChildProcess();
+    const spawnProcess = createSpawnMock([child]);
+    const files = createLimaSandboxFileOperations(SANDBOX, { spawnProcess });
+    const pending = files.read.access('/workspace/private.txt');
+    child.emit('close', 45);
+    await expect(pending).rejects.toMatchObject({
+      code: 'EACCES',
+      path: '/workspace/private.txt',
+      message: expect.stringContaining('permission denied'),
+    });
+    expect(scriptFrom(spawnProcess, 0)).toBe(
+      `test -e '${SANDBOX}/private.txt' || exit 44; test -r '${SANDBOX}/private.txt' || exit 45`
+    );
+  });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'maps unreadable and missing files to EACCES and ENOENT in a real shell',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'cowork-lima-read-'));
+      const spawnProcess = (_command: string, args: string[], options: SpawnOptions) =>
+        spawn('bash', ['-c', args[args.length - 1]], options);
+      try {
+        await writeFile(join(root, 'open.txt'), 'ok');
+        await writeFile(join(root, 'private.txt'), 'secret');
+        await chmod(join(root, 'private.txt'), 0o000);
+        const files = createLimaSandboxFileOperations(root, { spawnProcess });
+        await expect(files.read.access('/workspace/open.txt')).resolves.toBeUndefined();
+        await expect(files.read.access('/workspace/private.txt')).rejects.toMatchObject({
+          code: 'EACCES',
+          path: '/workspace/private.txt',
+        });
+        await expect(files.read.access('/workspace/absent.txt')).rejects.toMatchObject({
+          code: 'ENOENT',
+          path: '/workspace/absent.txt',
+        });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  );
+
   it('reports a guest permission failure as EACCES before editing', async () => {
     const child = new FakeChildProcess();
     const files = createLimaSandboxFileOperations(SANDBOX, {
@@ -824,7 +870,9 @@ describe('lima sandbox file tools', () => {
         text: expect.stringContaining('hello from sandbox'),
       }),
     ]);
-    expect(scriptFrom(spawnProcess, 0)).toBe(`test -e '${SANDBOX}/notes.txt' || exit 44`);
+    expect(scriptFrom(spawnProcess, 0)).toBe(
+      `test -e '${SANDBOX}/notes.txt' || exit 44; test -r '${SANDBOX}/notes.txt' || exit 45`
+    );
     expect(scriptFrom(spawnProcess, 1)).toBe(`head -c 4100 -- '${SANDBOX}/notes.txt'`);
     expect(scriptFrom(spawnProcess, 2)).toBe(`cat -- '${SANDBOX}/notes.txt'`);
   });
