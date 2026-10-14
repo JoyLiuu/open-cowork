@@ -338,10 +338,9 @@ describe('lima sandbox coding tools', () => {
 
   it('reads only SDK-generated host output files without sending them to Lima', async () => {
     const child = new FakeChildProcess();
-    const guestAccess = new FakeChildProcess();
     const guestSniff = new FakeChildProcess();
     const guestRead = new FakeChildProcess();
-    const spawnProcess = createSpawnMock([child, guestAccess, guestSniff, guestRead]);
+    const spawnProcess = createSpawnMock([child, guestSniff, guestRead]);
     const [read, bash] = createLimaSandboxCodingTools(SANDBOX, { spawnProcess });
     const output = 'guest-output\n'.repeat(12000);
     const pending = bash.execute('large-output', { command: 'generate-output' });
@@ -364,18 +363,17 @@ describe('lima sandbox coding tools', () => {
       expect(spawnProcess).toHaveBeenCalledTimes(1);
 
       const guestReading = read.execute('guest-file', { path: '/etc/hosts' });
-      guestAccess.emit('close', 0);
-      await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(3));
+      await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(2));
       guestSniff.stdout.emit('data', Buffer.from('guest hosts'));
       guestSniff.emit('close', 0);
-      await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(4));
+      await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(3));
       guestRead.stdout.emit('data', Buffer.from('guest hosts'));
       guestRead.emit('close', 0);
       await expect(guestReading).resolves.toMatchObject({
         content: [{ type: 'text', text: 'guest hosts' }],
       });
       expect(scriptFrom(spawnProcess, 1)).toBe(
-        "test -e '/etc/hosts' || exit 44; test -r '/etc/hosts' || exit 45"
+        "test -e '/etc/hosts' || exit 44; test -r '/etc/hosts' || exit 45; head -c 4100 -- '/etc/hosts'"
       );
     } finally {
       await rm(outputPath, { force: true });
@@ -449,10 +447,11 @@ describe('lima sandbox coding tools', () => {
       ];
       for (const [index, path] of blockedPaths.entries()) {
         const pending = read.execute(`blocked-${index}`, { path });
+        await vi.waitFor(() => expect(secondSpawn).toHaveBeenCalledTimes(index + 2));
         guestChecks[index].emit('close', 44);
         await expect(pending).rejects.toMatchObject({ code: 'ENOENT', path });
         expect(scriptFrom(secondSpawn, index + 1)).toBe(
-          `test -e '${path}' || exit 44; test -r '${path}' || exit 45`
+          `test -e '${path}' || exit 44; test -r '${path}' || exit 45; head -c 4100 -- '${path}'`
         );
       }
     } finally {
@@ -684,11 +683,11 @@ describe('lima sandbox file tools', () => {
     await expect(pending).rejects.toMatchObject({ code: 'ENOENT', path: '/workspace/missing.txt' });
   });
 
-  it('reports an unreadable guest file as EACCES before reading', async () => {
+  it('reports an unreadable guest file as EACCES when reading it', async () => {
     const child = new FakeChildProcess();
     const spawnProcess = createSpawnMock([child]);
     const files = createLimaSandboxFileOperations(SANDBOX, { spawnProcess });
-    const pending = files.read.access('/workspace/private.txt');
+    const pending = files.read.readFile('/workspace/private.txt');
     child.emit('close', 45);
     await expect(pending).rejects.toMatchObject({
       code: 'EACCES',
@@ -696,8 +695,15 @@ describe('lima sandbox file tools', () => {
       message: expect.stringContaining('permission denied'),
     });
     expect(scriptFrom(spawnProcess, 0)).toBe(
-      `test -e '${SANDBOX}/private.txt' || exit 44; test -r '${SANDBOX}/private.txt' || exit 45`
+      `test -e '${SANDBOX}/private.txt' || exit 44; test -r '${SANDBOX}/private.txt' || exit 45; cat -- '${SANDBOX}/private.txt'`
     );
+  });
+
+  it('starts no guest process for read access', async () => {
+    const spawnProcess = createSpawnMock([]);
+    const files = createLimaSandboxFileOperations(SANDBOX, { spawnProcess });
+    await expect(files.read.access('/workspace/notes.txt')).resolves.toBeUndefined();
+    expect(spawnProcess).not.toHaveBeenCalled();
   });
 
   it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
@@ -711,15 +717,20 @@ describe('lima sandbox file tools', () => {
         await writeFile(join(root, 'private.txt'), 'secret');
         await chmod(join(root, 'private.txt'), 0o000);
         const files = createLimaSandboxFileOperations(root, { spawnProcess });
-        await expect(files.read.access('/workspace/open.txt')).resolves.toBeUndefined();
-        await expect(files.read.access('/workspace/private.txt')).rejects.toMatchObject({
-          code: 'EACCES',
-          path: '/workspace/private.txt',
-        });
-        await expect(files.read.access('/workspace/absent.txt')).rejects.toMatchObject({
-          code: 'ENOENT',
-          path: '/workspace/absent.txt',
-        });
+        await expect(files.read.readFile('/workspace/open.txt')).resolves.toEqual(
+          Buffer.from('ok')
+        );
+        await expect(files.read.detectImageMimeType!('/workspace/open.txt')).resolves.toBeNull();
+        for (const operation of [files.read.readFile, files.read.detectImageMimeType!]) {
+          await expect(operation('/workspace/private.txt')).rejects.toMatchObject({
+            code: 'EACCES',
+            path: '/workspace/private.txt',
+          });
+          await expect(operation('/workspace/absent.txt')).rejects.toMatchObject({
+            code: 'ENOENT',
+            path: '/workspace/absent.txt',
+          });
+        }
       } finally {
         await rm(root, { recursive: true, force: true });
       }
@@ -744,7 +755,7 @@ describe('lima sandbox file tools', () => {
     const child = new FakeChildProcess();
     const spawnProcess = createSpawnMock([child]);
     const files = createLimaSandboxFileOperations(SANDBOX, { spawnProcess });
-    const pending = files.read.access('/workspace/missing.txt');
+    const pending = files.read.detectImageMimeType!('/workspace/missing.txt');
     child.emit('close', 44);
     await expect(pending).rejects.toMatchObject({
       code: 'ENOENT',
@@ -752,11 +763,11 @@ describe('lima sandbox file tools', () => {
     });
   });
 
-  it('preserves Lima failures when checking guest access', async () => {
+  it('preserves Lima failures when reading a guest file', async () => {
     const child = new FakeChildProcess();
     const spawnProcess = createSpawnMock([child]);
     const files = createLimaSandboxFileOperations(SANDBOX, { spawnProcess });
-    const pending = files.read.access('/workspace/missing.txt');
+    const pending = files.read.readFile('/workspace/missing.txt');
     child.stderr.emit('data', Buffer.from('Lima instance unavailable'));
     child.emit('close', 1);
     await expect(pending).rejects.toThrow('Lima instance unavailable');
@@ -792,18 +803,16 @@ describe('lima sandbox file tools', () => {
   ] as const)(
     'returns a guest %s through the Lima read tool as an image',
     async (_label, bytes, mimeType) => {
-      const access = new FakeChildProcess();
       const sniff = new FakeChildProcess();
       const readFileProcess = new FakeChildProcess();
-      const spawnProcess = createSpawnMock([access, sniff, readFileProcess]);
+      const spawnProcess = createSpawnMock([sniff, readFileProcess]);
       const [read] = createLimaSandboxCodingTools(SANDBOX, { spawnProcess });
 
       const pending = read.execute('read-image', { path: '/workspace/picture' });
-      access.emit('close', 0);
-      await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(1));
       sniff.stdout.emit('data', bytes.subarray(0, 4100));
       sniff.emit('close', 0);
-      await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(3));
+      await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(2));
       readFileProcess.stdout.emit('data', bytes);
       readFileProcess.emit('close', 0);
 
@@ -815,8 +824,10 @@ describe('lima sandbox file tools', () => {
         }),
         expect.objectContaining({ type: 'image', mimeType }),
       ]);
-      expect(scriptFrom(spawnProcess, 1)).toBe(`head -c 4100 -- '${SANDBOX}/picture'`);
-      expect(scriptFrom(spawnProcess, 2)).toBe(`cat -- '${SANDBOX}/picture'`);
+      const guard = `test -e '${SANDBOX}/picture' || exit 44; test -r '${SANDBOX}/picture' || exit 45`;
+      expect(scriptFrom(spawnProcess, 0)).toBe(`${guard}; head -c 4100 -- '${SANDBOX}/picture'`);
+      expect(scriptFrom(spawnProcess, 1)).toBe(`${guard}; cat -- '${SANDBOX}/picture'`);
+      expect(spawnProcess).toHaveBeenCalledTimes(2);
     }
   );
 
@@ -847,19 +858,17 @@ describe('lima sandbox file tools', () => {
   });
 
   it('reads a virtual workspace file from the guest sandbox', async () => {
-    const access = new FakeChildProcess();
     const sniff = new FakeChildProcess();
     const read = new FakeChildProcess();
-    const spawnProcess = createSpawnMock([access, sniff, read]);
+    const spawnProcess = createSpawnMock([sniff, read]);
     const files = createLimaSandboxFileOperations(SANDBOX, { spawnProcess });
     const readTool = createReadTool(SANDBOX, { operations: files.read });
 
     const pending = readTool.execute('call-1', { path: '/workspace/notes.txt' });
-    access.emit('close', 0);
-    await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(1));
     sniff.stdout.emit('data', Buffer.from('hello from sandbox'));
     sniff.emit('close', 0);
-    await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(2));
     read.stdout.emit('data', Buffer.from('hello from sandbox'));
     read.emit('close', 0);
 
@@ -870,11 +879,10 @@ describe('lima sandbox file tools', () => {
         text: expect.stringContaining('hello from sandbox'),
       }),
     ]);
-    expect(scriptFrom(spawnProcess, 0)).toBe(
-      `test -e '${SANDBOX}/notes.txt' || exit 44; test -r '${SANDBOX}/notes.txt' || exit 45`
-    );
-    expect(scriptFrom(spawnProcess, 1)).toBe(`head -c 4100 -- '${SANDBOX}/notes.txt'`);
-    expect(scriptFrom(spawnProcess, 2)).toBe(`cat -- '${SANDBOX}/notes.txt'`);
+    const guard = `test -e '${SANDBOX}/notes.txt' || exit 44; test -r '${SANDBOX}/notes.txt' || exit 45`;
+    expect(scriptFrom(spawnProcess, 0)).toBe(`${guard}; head -c 4100 -- '${SANDBOX}/notes.txt'`);
+    expect(scriptFrom(spawnProcess, 1)).toBe(`${guard}; cat -- '${SANDBOX}/notes.txt'`);
+    expect(spawnProcess).toHaveBeenCalledTimes(2);
   });
 
   it('writes a virtual workspace file through the guest shell', async () => {

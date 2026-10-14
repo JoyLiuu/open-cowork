@@ -365,24 +365,25 @@ export function createLimaSandboxFileOperations(
   const guestPath = (pathValue: string) =>
     shellEscapePath(mapVirtualWorkspacePath(pathValue, root));
 
+  // Existence and permission are checked by the guest command that reads, so a
+  // read costs two guest calls. `access` has nothing left to check on its own.
+  const guardedRead = (absolutePath: string, command: string): Promise<Buffer> => {
+    const target = `'${guestPath(absolutePath)}'`;
+    return runGuestOrThrow(
+      spawnProcess,
+      instanceName,
+      `test -e ${target} || exit ${GUEST_FILE_MISSING_EXIT_CODE}; ` +
+        `test -r ${target} || exit ${GUEST_FILE_PERMISSION_EXIT_CODE}; ${command} -- ${target}`,
+      undefined,
+      absolutePath
+    );
+  };
+
   const read: ReadOperations = {
-    access: (absolutePath) =>
-      runGuestOrThrow(
-        spawnProcess,
-        instanceName,
-        `test -e '${guestPath(absolutePath)}' || exit ${GUEST_FILE_MISSING_EXIT_CODE}; ` +
-          `test -r '${guestPath(absolutePath)}' || exit ${GUEST_FILE_PERMISSION_EXIT_CODE}`,
-        undefined,
-        absolutePath
-      ).then(() => undefined),
-    readFile: (absolutePath) =>
-      runGuestOrThrow(spawnProcess, instanceName, `cat -- '${guestPath(absolutePath)}'`),
+    access: () => Promise.resolve(),
+    readFile: (absolutePath) => guardedRead(absolutePath, 'cat'),
     detectImageMimeType: async (absolutePath) => {
-      const header = await runGuestOrThrow(
-        spawnProcess,
-        instanceName,
-        `head -c ${IMAGE_SNIFF_BYTES} -- '${guestPath(absolutePath)}'`
-      );
+      const header = await guardedRead(absolutePath, `head -c ${IMAGE_SNIFF_BYTES}`);
       return imageMimeTypeFromHeader(header.subarray(0, IMAGE_SNIFF_BYTES));
     },
   };
