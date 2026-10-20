@@ -571,9 +571,12 @@ export function initDatabase(): DatabaseInstance {
 
         if (setClauses.length === 0) return;
 
-        // Always update updated_at
-        setClauses.push('updated_at = ?');
-        values.push(Date.now());
+        // Bump updated_at unless the caller supplied an explicit value (a second
+        // assignment would otherwise silently override it).
+        if (updates.updated_at === undefined) {
+          setClauses.push('updated_at = ?');
+          values.push(Date.now());
+        }
         values.push(id);
 
         const sql = `UPDATE sessions SET ${setClauses.join(', ')} WHERE id = ?`;
