@@ -7,7 +7,7 @@
  * - Session CRUD: create, continue, stop, delete, list
  * - Chat history persistence to SQLite via DatabaseInstance
  * - Workspace-scoped sessions with sandbox integration
- * - Delegates AI execution to ClaudeAgentRunner
+ * - Delegates AI execution to CoworkAgentRunner
  *
  * Dependencies: database, agent-runner, config-store, mcp-manager, sandbox-adapter
  */
@@ -26,6 +26,7 @@ import type {
 } from '../../renderer/types';
 import type { DatabaseInstance, TraceStepRow } from '../db/database';
 import { PathResolver } from '../sandbox/path-resolver';
+import { SessionNotFoundError } from './session-errors';
 import {
   SandboxAdapter,
   getSandboxAdapter,
@@ -33,7 +34,7 @@ import {
   reinitializeSandbox,
 } from '../sandbox/sandbox-adapter';
 import { SandboxSync } from '../sandbox/sandbox-sync';
-import { ClaudeAgentRunner } from '../claude/agent-runner';
+import { CoworkAgentRunner } from '../agent/agent-runner';
 import { configStore } from '../config/config-store';
 import { MCPManager } from '../mcp/mcp-manager';
 import { mcpConfigStore } from '../mcp/mcp-config-store';
@@ -55,14 +56,27 @@ import {
   getDefaultTitleFromPrompt,
   normalizeGeneratedTitle,
 } from './session-title-utils';
-import { generateTitleWithClaudeSdk } from '../claude/claude-sdk-one-shot';
+import { generateTitleWithSdk } from '../agent/sdk-one-shot';
 import { buildScheduledTaskTitle } from '../../shared/schedule/task-title';
+import { MAX_RENAMED_SESSION_TITLE_LENGTH } from '../../shared/session-title';
 
 interface AgentRunner {
   run(session: Session, prompt: string, existingMessages: Message[]): Promise<void>;
   cancel(sessionId: string): void;
   clearSdkSession?(sessionId: string): void;
   clearAllSdkSessions?(): void;
+  compact?(
+    sessionId: string,
+    customInstructions?: string
+  ): Promise<{
+    summary: string;
+    firstKeptEntryId: string;
+    tokensBefore: number;
+    details?: unknown;
+  } | null>;
+  getContextUsage?(
+    sessionId: string
+  ): { tokens: number | null; contextWindow: number; percent: number | null } | null;
 }
 
 const WORKSPACE_MOUNT_VIRTUAL_PATH = '/mnt/workspace';
@@ -127,12 +141,12 @@ export class SessionManager {
    * Can be called to recreate runner when config changes
    */
   private createAgentRunner(): void {
-    this.agentRunner = this.createClaudeAgentRunner();
+    this.agentRunner = this.createCoworkAgentRunner();
     log('[SessionManager] Using Open Cowork agent runner');
   }
 
-  private createClaudeAgentRunner(): ClaudeAgentRunner {
-    return new ClaudeAgentRunner(
+  private createCoworkAgentRunner(): CoworkAgentRunner {
+    return new CoworkAgentRunner(
       {
         sendToRenderer: this.sendToRenderer,
         saveMessage: (message: Message) => this.saveMessage(message),
@@ -176,7 +190,7 @@ export class SessionManager {
    */
   invalidateMcpServersCache(): void {
     if (this.agentRunner && 'invalidateMcpServersCache' in this.agentRunner) {
-      (this.agentRunner as ClaudeAgentRunner).invalidateMcpServersCache();
+      (this.agentRunner as CoworkAgentRunner).invalidateMcpServersCache();
     }
   }
 
@@ -186,7 +200,7 @@ export class SessionManager {
    */
   invalidateSkillsSetup(): void {
     if (this.agentRunner && 'invalidateSkillsSetup' in this.agentRunner) {
-      (this.agentRunner as ClaudeAgentRunner).invalidateSkillsSetup();
+      (this.agentRunner as CoworkAgentRunner).invalidateSkillsSetup();
     }
   }
 
@@ -263,7 +277,10 @@ export class SessionManager {
     // Start processing the prompt with content blocks
     this.enqueuePrompt(session, prompt, content);
 
-    return session;
+    // enqueuePrompt already flipped the persisted status to 'running'; reload
+    // so the renderer adds the session already running instead of dropping the
+    // status event it emitted before this resolved.
+    return this.loadSession(session.id) ?? session;
   }
 
   // Create a new session object
@@ -369,6 +386,14 @@ export class SessionManager {
     };
   }
 
+  /**
+   * Existence check used by RemoteManager's stale-binding probe: a session may
+   * be deleted from the desktop UI while a channel binding still points at it.
+   */
+  hasSession(sessionId: string): boolean {
+    return Boolean(this.loadSession(sessionId));
+  }
+
   // List all sessions
   listSessions(): Session[] {
     const rows = this.db.sessions.getAll();
@@ -417,7 +442,7 @@ export class SessionManager {
 
     const session = this.loadSession(sessionId);
     if (!session) {
-      throw new Error(`Session not found: ${sessionId}`);
+      throw new SessionNotFoundError(sessionId);
     }
 
     this.enqueuePrompt(session, prompt, content);
@@ -615,7 +640,7 @@ export class SessionManager {
     return processedContent;
   }
 
-  // Process a prompt using ClaudeAgentRunner
+  // Process a prompt using CoworkAgentRunner
   private async processPrompt(
     session: Session,
     prompt: string,
@@ -832,9 +857,7 @@ export class SessionManager {
 
   private async generateTitleWithConfig(titlePrompt: string): Promise<string | null> {
     // Always use pi-ai SDK for title generation
-    return normalizeGeneratedTitle(
-      await generateTitleWithClaudeSdk(titlePrompt, configStore.getAll())
-    );
+    return normalizeGeneratedTitle(await generateTitleWithSdk(titlePrompt, configStore.getAll()));
   }
 
   private enqueuePrompt(session: Session, prompt: string, content?: ContentBlock[]): void {
@@ -1025,12 +1048,27 @@ export class SessionManager {
 
   // Update session status
   private updateSessionStatus(sessionId: string, status: Session['status']): void {
-    this.db.sessions.update(sessionId, { status, updated_at: Date.now() });
+    const updatedAt = Date.now();
+    this.db.sessions.update(sessionId, { status, updated_at: updatedAt });
 
     this.sendToRenderer({
       type: 'session.status',
-      payload: { sessionId, status },
+      payload: { sessionId, status, updatedAt },
     });
+  }
+
+  renameSession(sessionId: string, title: string): void {
+    // The payload comes from IPC clients, so its type is not guaranteed.
+    const trimmed = typeof title === 'string' ? title.trim() : '';
+    if (!trimmed) {
+      throw new Error('Session title cannot be empty');
+    }
+    if (trimmed.length > MAX_RENAMED_SESSION_TITLE_LENGTH) {
+      throw new Error(`Session title cannot exceed ${MAX_RENAMED_SESSION_TITLE_LENGTH} characters`);
+    }
+    if (!this.updateSessionTitle(sessionId, trimmed)) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
   }
 
   private updateSessionTitle(sessionId: string, title: string): boolean {
@@ -1083,6 +1121,39 @@ export class SessionManager {
 
   clearAllCachedAgentSessions(): void {
     this.agentRunner?.clearAllSdkSessions?.();
+  }
+
+  /**
+   * Manually trigger context compaction for a session.
+   * Delegates to the agent runner's compact() method.
+   */
+  async compactSession(
+    sessionId: string,
+    customInstructions?: string
+  ): Promise<{
+    summary: string;
+    firstKeptEntryId: string;
+    tokensBefore: number;
+    details?: unknown;
+  } | null> {
+    if (!this.agentRunner?.compact) {
+      logWarn('[SessionManager] Agent runner does not support compact()');
+      return null;
+    }
+    return this.agentRunner.compact(sessionId, customInstructions);
+  }
+
+  /**
+   * Get current context usage for a session.
+   * Delegates to the agent runner's getContextUsage() method.
+   */
+  getContextUsage(
+    sessionId: string
+  ): { tokens: number | null; contextWindow: number; percent: number | null } | null {
+    if (!this.agentRunner?.getContextUsage) {
+      return null;
+    }
+    return this.agentRunner.getContextUsage(sessionId);
   }
 
   // Save message to database

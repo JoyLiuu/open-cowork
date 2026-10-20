@@ -11,6 +11,8 @@
  *
  * Dependencies: electron-store, auth-utils, api-model-presets
  */
+import * as fs from 'fs';
+import * as path from 'path';
 import Store, { type Options as StoreOptions } from 'electron-store';
 import { log, logWarn } from '../utils/logger';
 import {
@@ -30,6 +32,7 @@ import {
   shouldUseAnthropicAuthToken,
 } from './auth-utils';
 import { API_PROVIDER_PRESETS, PI_AI_CURATED_PRESETS } from '../../shared/api-model-presets';
+import { normalizeSubagentConfig, type SubagentConfig } from '../../shared/subagent-config';
 
 /**
  * Application configuration schema
@@ -76,6 +79,8 @@ export interface ApiConfigSet {
 }
 
 export interface AppConfig {
+  subagent?: SubagentConfig;
+  subagentConfigError?: string;
   // API Provider
   provider: ProviderType;
 
@@ -98,7 +103,7 @@ export interface AppConfig {
   configSets: ApiConfigSet[];
 
   // Optional: Claude Code CLI path override
-  claudeCodePath?: string;
+  agentCliPath?: string;
 
   // Optional: Default working directory
   defaultWorkdir?: string;
@@ -162,7 +167,7 @@ const DIRECT_READ_KEYS = new Set<keyof AppConfig>([
   'customProtocol',
   'activeProfileKey',
   'activeConfigSetId',
-  'claudeCodePath',
+  'agentCliPath',
   'defaultWorkdir',
   'globalSkillsPath',
   'enableDevLogs',
@@ -172,6 +177,69 @@ const DIRECT_READ_KEYS = new Set<keyof AppConfig>([
   'enableThinking',
   'isConfigured',
 ]);
+
+/**
+ * Fields safe to expose in the plaintext config file.
+ * NEVER include API keys, tokens, or other secrets.
+ */
+export const EXPORTABLE_FIELDS: (keyof AppConfig)[] = [
+  'defaultWorkdir',
+  'globalSkillsPath',
+  'theme',
+  'enableDevLogs',
+  'sandboxEnabled',
+  'enableThinking',
+  'memoryEnabled',
+  'model',
+  'provider',
+  'contextWindow',
+  'maxTokens',
+];
+
+/**
+ * True for a finite number greater than zero. Rejects NaN/Infinity so callers
+ * that claim "valid positive number" cannot persist non-finite overrides.
+ */
+function isValidPositiveNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+/**
+ * Assign an optional positive numeric field, or drop it. electron-store/conf
+ * throws if a present key is explicitly `undefined`, and spreading a previous
+ * config can leak a stale override when the next profile omits the field.
+ */
+function assignOptionalPositiveNumber<K extends 'contextWindow' | 'maxTokens'>(
+  result: { contextWindow?: number; maxTokens?: number },
+  key: K,
+  value: unknown
+): void {
+  if (isValidPositiveNumber(value)) {
+    result[key] = value;
+  } else {
+    delete result[key];
+  }
+}
+
+/**
+ * Per-field type/value validators applied when importing the plaintext config
+ * file (see `importSafeConfig`). Fields not listed here are accepted as-is.
+ */
+export const FIELD_VALIDATORS: Record<string, (v: unknown) => boolean> = {
+  defaultWorkdir: (v) => typeof v === 'string',
+  globalSkillsPath: (v) => typeof v === 'string',
+  theme: (v) => v === 'dark' || v === 'light' || v === 'system',
+  enableDevLogs: (v) => typeof v === 'boolean',
+  sandboxEnabled: (v) => typeof v === 'boolean',
+  enableThinking: (v) => typeof v === 'boolean',
+  memoryEnabled: (v) => typeof v === 'boolean',
+  model: (v) => typeof v === 'string',
+  provider: (v) =>
+    typeof v === 'string' &&
+    ['openrouter', 'anthropic', 'custom', 'openai', 'gemini', 'ollama'].includes(v),
+  contextWindow: isValidPositiveNumber,
+  maxTokens: isValidPositiveNumber,
+};
 
 const defaultProfiles: Record<ProviderProfileKey, ProviderProfile> = {
   openrouter: {
@@ -238,7 +306,7 @@ const defaultConfig: AppConfig = {
   profiles: defaultProfiles,
   activeConfigSetId: DEFAULT_CONFIG_SET_ID,
   configSets: [defaultConfigSet],
-  claudeCodePath: '',
+  agentCliPath: '',
   defaultWorkdir: '',
   globalSkillsPath: '',
   enableDevLogs: false,
@@ -542,8 +610,7 @@ export class ConfigStore {
   }
 
   private ensureNormalized(): void {
-    const normalized = this.normalizeConfig(this.store.store as Partial<AppConfig>);
-    this.store.set(normalized);
+    this.saveConfig(this.store.store as Partial<AppConfig>);
   }
 
   /**
@@ -612,12 +679,8 @@ export class ConfigStore {
       model,
     };
     // Preserve optional numeric fields so callers don't silently lose user-set values
-    if (typeof profile?.contextWindow === 'number' && profile.contextWindow > 0) {
-      result.contextWindow = profile.contextWindow;
-    }
-    if (typeof profile?.maxTokens === 'number' && profile.maxTokens > 0) {
-      result.maxTokens = profile.maxTokens;
-    }
+    assignOptionalPositiveNumber(result, 'contextWindow', profile?.contextWindow);
+    assignOptionalPositiveNumber(result, 'maxTokens', profile?.maxTokens);
     return result;
   }
 
@@ -954,6 +1017,14 @@ export class ConfigStore {
     const activeConfigSet = configSets.find((set) => set.id === activeConfigSetId) || configSets[0];
     const projected = this.projectFromConfigSet(activeConfigSet);
 
+    let subagent: SubagentConfig | undefined;
+    let subagentConfigError: string | undefined;
+    try {
+      subagent = normalizeSubagentConfig(raw.subagent);
+    } catch (error) {
+      subagentConfigError = error instanceof Error ? error.message : String(error);
+    }
+
     const result: AppConfig = {
       provider: projected.provider,
       customProtocol: projected.customProtocol,
@@ -964,8 +1035,8 @@ export class ConfigStore {
       profiles: projected.profiles,
       activeConfigSetId,
       configSets,
-      claudeCodePath:
-        typeof raw.claudeCodePath === 'string' ? raw.claudeCodePath : defaultConfig.claudeCodePath,
+      agentCliPath:
+        typeof raw.agentCliPath === 'string' ? raw.agentCliPath : defaultConfig.agentCliPath,
       defaultWorkdir:
         typeof raw.defaultWorkdir === 'string' ? raw.defaultWorkdir : defaultConfig.defaultWorkdir,
       globalSkillsPath:
@@ -977,9 +1048,13 @@ export class ConfigStore {
       sandboxEnabled: toBoolean(raw.sandboxEnabled, defaultConfig.sandboxEnabled),
       memoryEnabled: toBoolean(raw.memoryEnabled, defaultConfig.memoryEnabled),
       memoryRuntime: normalizeMemoryRuntimeConfig(raw.memoryRuntime),
+      subagent,
+      ...(subagentConfigError ? { subagentConfigError } : {}),
       enableThinking: projected.enableThinking,
       isConfigured: toBoolean(raw.isConfigured, defaultConfig.isConfigured),
     };
+    assignOptionalPositiveNumber(result, 'contextWindow', projected.contextWindow);
+    assignOptionalPositiveNumber(result, 'maxTokens', projected.maxTokens);
     this.normalizeModelIds(result);
     return result;
   }
@@ -992,9 +1067,13 @@ export class ConfigStore {
     };
   }
 
-  private saveConfig(config: AppConfig): void {
-    const normalized = this.normalizeConfig(config);
-    this.store.set(normalized);
+  private saveConfig(config: Partial<AppConfig>): void {
+    const { subagent, subagentConfigError, ...rest } = this.normalizeConfig(config);
+    // Merge other fields while preserving the invalid persisted subagent for repair.
+    this.store.set({
+      ...rest,
+      ...(config.subagentConfigError || subagentConfigError ? {} : { subagent }),
+    });
   }
 
   private composeProjectedConfig(
@@ -1005,7 +1084,7 @@ export class ConfigStore {
     const activeConfigSet =
       nextConfigSets.find((set) => set.id === requestedActiveConfigSetId) || nextConfigSets[0];
     const projected = this.projectFromConfigSet(activeConfigSet);
-    return {
+    const result: AppConfig = {
       ...base,
       provider: projected.provider,
       customProtocol: projected.customProtocol,
@@ -1018,6 +1097,10 @@ export class ConfigStore {
       activeConfigSetId: activeConfigSet.id,
       configSets: nextConfigSets,
     };
+    // Clear rather than leave stale: `...base` can carry the previous set's value.
+    assignOptionalPositiveNumber(result, 'contextWindow', projected.contextWindow);
+    assignOptionalPositiveNumber(result, 'maxTokens', projected.maxTokens);
+    return result;
   }
 
   private buildUniqueConfigSetName(
@@ -1377,8 +1460,8 @@ export class ConfigStore {
     const projectedConfig = this.composeProjectedConfig(current, nextConfigSets, activeConfigSetId);
     this.saveConfig({
       ...projectedConfig,
-      claudeCodePath:
-        updates.claudeCodePath !== undefined ? updates.claudeCodePath : current.claudeCodePath,
+      agentCliPath:
+        updates.agentCliPath !== undefined ? updates.agentCliPath : current.agentCliPath,
       defaultWorkdir:
         updates.defaultWorkdir !== undefined ? updates.defaultWorkdir : current.defaultWorkdir,
       globalSkillsPath:
@@ -1396,6 +1479,11 @@ export class ConfigStore {
         updates.memoryRuntime !== undefined
           ? normalizeMemoryRuntimeConfig(updates.memoryRuntime)
           : current.memoryRuntime,
+      subagent:
+        updates.subagent === undefined
+          ? current.subagent
+          : normalizeSubagentConfig(updates.subagent),
+      subagentConfigError: updates.subagent === undefined ? current.subagentConfigError : undefined,
       isConfigured:
         updates.isConfigured !== undefined ? updates.isConfigured : current.isConfigured,
     });
@@ -1539,7 +1627,7 @@ export class ConfigStore {
     delete process.env.OPENAI_ACCOUNT_ID;
     delete process.env.GEMINI_API_KEY;
     delete process.env.GEMINI_BASE_URL;
-    delete process.env.CLAUDE_CODE_PATH;
+    delete process.env.AGENT_CLI_PATH;
     delete process.env.COWORK_WORKDIR;
 
     const useOpenAI =
@@ -1627,7 +1715,7 @@ export class ConfigStore {
       }
     }
 
-    // claudeCodePath is no longer used (the agent SDK handles model routing natively)
+    // agentCliPath is no longer used (the agent SDK handles model routing natively)
 
     if (projectedConfig.defaultWorkdir) {
       process.env.COWORK_WORKDIR = projectedConfig.defaultWorkdir;
@@ -1645,6 +1733,80 @@ export class ConfigStore {
       GEMINI_API_KEY: process.env.GEMINI_API_KEY ? '✓ Set' : '(empty/unset)',
       GEMINI_BASE_URL: process.env.GEMINI_BASE_URL || '(default)',
     });
+  }
+
+  /**
+   * Export non-sensitive config to a plaintext JSON file.
+   * File location: {userData}/config.public.json
+   */
+  exportSafeConfig(): void {
+    const config = this.getAll();
+    const safeSubset: Partial<AppConfig> = {};
+    for (const key of EXPORTABLE_FIELDS) {
+      if (config[key] !== undefined) {
+        (safeSubset as Record<string, unknown>)[key] = config[key];
+      }
+    }
+    const filePath = this.getPublicConfigPath();
+    fs.writeFileSync(filePath, JSON.stringify(safeSubset, null, 2), 'utf-8');
+    log('[ConfigStore] Exported safe config to:', filePath);
+  }
+
+  /**
+   * Import config from the plaintext JSON file, applying only safe fields.
+   * Returns true if any fields were applied, false otherwise.
+   */
+  importSafeConfig(): boolean {
+    const filePath = this.getPublicConfigPath();
+    if (!fs.existsSync(filePath)) return false;
+
+    let raw: string;
+    try {
+      raw = fs.readFileSync(filePath, 'utf-8');
+    } catch (err) {
+      logWarn('[ConfigStore] Failed to read public config file:', err);
+      return false;
+    }
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      logWarn('[ConfigStore] Public config file contains malformed JSON, skipping import:', err);
+      return false;
+    }
+
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      logWarn('[ConfigStore] Public config file root is not an object, skipping import');
+      return false;
+    }
+
+    // Only apply fields that are in the exportable set AND pass type validation
+    const updates: Partial<AppConfig> = {};
+    for (const key of EXPORTABLE_FIELDS) {
+      if (key in parsed && parsed[key] !== undefined) {
+        const validator = FIELD_VALIDATORS[key];
+        if (validator && !validator(parsed[key])) {
+          logWarn(`[ConfigStore] Skipping invalid value for "${key}":`, parsed[key]);
+          continue;
+        }
+        (updates as Record<string, unknown>)[key] = parsed[key];
+      }
+    }
+
+    if (Object.keys(updates).length > 0) {
+      this.update(updates);
+      log('[ConfigStore] Imported safe config from:', filePath, 'fields:', Object.keys(updates));
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Get the path to the public plaintext config file.
+   */
+  getPublicConfigPath(): string {
+    return path.join(path.dirname(this.getPath()), 'config.public.json');
   }
 
   /**

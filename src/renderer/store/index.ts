@@ -31,6 +31,17 @@ export interface SessionExecutionClock {
   endAt: number | null;
 }
 
+export interface CompactionEvent {
+  id: string;
+  timestamp: number;
+  tokensBefore: number;
+  tokensAfter: number | null;
+  summary: string;
+  readFiles: string[];
+  modifiedFiles: string[];
+  type: 'auto' | 'manual';
+}
+
 // Unified per-session state that replaces 8 parallel xxxBySession Maps
 export interface SessionState {
   messages: Message[];
@@ -41,6 +52,7 @@ export interface SessionState {
   executionClock: SessionExecutionClock;
   traceSteps: TraceStep[];
   contextWindow: number;
+  compactionHistory: CompactionEvent[];
 }
 
 const DEFAULT_SESSION_STATE: SessionState = {
@@ -52,6 +64,7 @@ const DEFAULT_SESSION_STATE: SessionState = {
   executionClock: { startAt: null, endAt: null },
   traceSteps: [],
   contextWindow: 0,
+  compactionHistory: [],
 };
 
 // Helper to immutably update a single session's state within the record
@@ -79,6 +92,12 @@ interface AppState {
 
   // Per-session state (messages, partials, turns, traces, etc.)
   sessionStates: Record<string, SessionState>;
+
+  // Ephemeral viewport state, kept separate so scrolling does not rerender message consumers.
+  sessionScrollPositions: Record<string, number>;
+
+  // Unsent composer text, kept separate so typing does not rerender message consumers.
+  sessionInputDrafts: Record<string, string>;
 
   // UI state
   isLoading: boolean;
@@ -125,6 +144,8 @@ interface AppState {
   removeSession: (sessionId: string) => void;
   removeSessions: (sessionIds: string[]) => void;
   setActiveSession: (sessionId: string | null) => void;
+  setSessionScrollPosition: (sessionId: string, scrollTop: number) => void;
+  setSessionInputDraft: (sessionId: string, draft: string) => void;
 
   addMessage: (sessionId: string, message: Message) => void;
   updateMessage: (sessionId: string, messageId: string, updates: Partial<Message>) => void;
@@ -185,6 +206,9 @@ interface AppState {
   // Context window actions
   setSessionContextWindow: (sessionId: string, contextWindow: number) => void;
 
+  // Compaction history actions
+  addCompactionEvent: (sessionId: string, event: CompactionEvent) => void;
+
   // System theme actions
   setSystemDarkMode: (dark: boolean) => void;
 }
@@ -222,6 +246,8 @@ export const useAppStore = create<AppState>((set) => ({
   sessions: [],
   activeSessionId: null,
   sessionStates: {},
+  sessionScrollPositions: {},
+  sessionInputDrafts: {},
   isLoading: false,
   sidebarCollapsed: false,
   contextPanelCollapsed: false,
@@ -263,9 +289,17 @@ export const useAppStore = create<AppState>((set) => ({
   removeSession: (sessionId) =>
     set((state) => {
       const { [sessionId]: _, ...restSessionStates } = state.sessionStates;
+      const restScrollPositions = Object.fromEntries(
+        Object.entries(state.sessionScrollPositions).filter(([id]) => id !== sessionId)
+      );
+      const restInputDrafts = Object.fromEntries(
+        Object.entries(state.sessionInputDrafts).filter(([id]) => id !== sessionId)
+      );
       return {
         sessions: state.sessions.filter((s) => s.id !== sessionId),
         sessionStates: restSessionStates,
+        sessionScrollPositions: restScrollPositions,
+        sessionInputDrafts: restInputDrafts,
         activeSessionId: state.activeSessionId === sessionId ? null : state.activeSessionId,
       };
     }),
@@ -274,19 +308,55 @@ export const useAppStore = create<AppState>((set) => ({
     set((state) => {
       const idSet = new Set(sessionIds);
       const newSessionStates: Record<string, SessionState> = {};
+      const newScrollPositions: Record<string, number> = {};
+      const newInputDrafts: Record<string, string> = {};
       for (const key of Object.keys(state.sessionStates)) {
         if (!idSet.has(key)) newSessionStates[key] = state.sessionStates[key];
+      }
+      for (const key of Object.keys(state.sessionScrollPositions)) {
+        if (!idSet.has(key)) newScrollPositions[key] = state.sessionScrollPositions[key];
+      }
+      for (const key of Object.keys(state.sessionInputDrafts)) {
+        if (!idSet.has(key)) newInputDrafts[key] = state.sessionInputDrafts[key];
       }
 
       return {
         sessions: state.sessions.filter((s) => !idSet.has(s.id)),
         sessionStates: newSessionStates,
+        sessionScrollPositions: newScrollPositions,
+        sessionInputDrafts: newInputDrafts,
         activeSessionId:
           state.activeSessionId && idSet.has(state.activeSessionId) ? null : state.activeSessionId,
       };
     }),
 
   setActiveSession: (sessionId) => set({ activeSessionId: sessionId }),
+
+  setSessionScrollPosition: (sessionId, scrollTop) =>
+    set((state) => ({
+      sessionScrollPositions: {
+        ...state.sessionScrollPositions,
+        [sessionId]: scrollTop,
+      },
+    })),
+
+  setSessionInputDraft: (sessionId, draft) =>
+    set((state) => {
+      if (!draft) {
+        if (!(sessionId in state.sessionInputDrafts)) return state;
+        const restInputDrafts = Object.fromEntries(
+          Object.entries(state.sessionInputDrafts).filter(([id]) => id !== sessionId)
+        );
+        return { sessionInputDrafts: restInputDrafts };
+      }
+      if (state.sessionInputDrafts[sessionId] === draft) return state;
+      return {
+        sessionInputDrafts: {
+          ...state.sessionInputDrafts,
+          [sessionId]: draft,
+        },
+      };
+    }),
 
   // Message actions
   addMessage: (sessionId, message) =>
@@ -591,6 +661,21 @@ export const useAppStore = create<AppState>((set) => ({
     set((state) => ({
       sessionStates: patchSession(state.sessionStates, sessionId, { contextWindow }),
     })),
+
+  // Compaction history actions
+  addCompactionEvent: (sessionId, event) =>
+    set((state) => {
+      const current = state.sessionStates[sessionId] ?? DEFAULT_SESSION_STATE;
+      return {
+        sessionStates: {
+          ...state.sessionStates,
+          [sessionId]: {
+            ...current,
+            compactionHistory: [...current.compactionHistory, event],
+          },
+        },
+      };
+    }),
 
   // System theme actions
   setSystemDarkMode: (dark) => set({ systemDarkMode: dark }),

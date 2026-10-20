@@ -11,7 +11,7 @@ const mockConfigState = vi.hoisted(() => ({
     profiles: {},
     activeConfigSetId: 'default',
     configSets: [],
-    claudeCodePath: '',
+    agentCliPath: '',
     defaultWorkdir: '',
     globalSkillsPath: '',
     enableDevLogs: false,
@@ -230,6 +230,7 @@ function createDatabaseInstance(db: Database.Database): DatabaseInstance {
         () => db.prepare('SELECT * FROM sessions ORDER BY created_at ASC').all() as SessionRow[]
       ),
       delete: vi.fn(),
+      markRunningIdle: vi.fn(),
     },
     messages: {
       create: vi.fn(),

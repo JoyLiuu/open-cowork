@@ -14,10 +14,12 @@ import type {
   PluginToggleResult,
   PluginComponentKind,
   ScheduleTask,
+  ScheduleRunNowResult,
   ScheduleCreateInput,
   ScheduleUpdateInput,
   ProviderModelInfo,
   LocalOllamaDiscoveryResult,
+  CoreMemoryListEntry,
   MemoryOverview,
   MemorySearchResult,
   MemoryReadResult,
@@ -50,10 +52,13 @@ const ALLOWED_CLIENT_EVENTS: ReadonlySet<string> = new Set<ClientEvent['type']>(
   'session.continue',
   'session.stop',
   'session.delete',
+  'session.rename',
   'session.batchDelete',
   'session.list',
   'session.getMessages',
   'session.getTraceSteps',
+  'session.compact',
+  'session.getContextUsage',
   'permission.response',
   'sudo.password.response',
   'settings.update',
@@ -62,6 +67,19 @@ const ALLOWED_CLIENT_EVENTS: ReadonlySet<string> = new Set<ClientEvent['type']>(
   'workdir.set',
   'workdir.select',
 ]);
+
+// Invoke a whitelisted ClientEvent and wait for the response. Defined once at
+// module scope so both the generic `invoke()` API and the typed `session.*`
+// helpers below share the same ALLOWED_CLIENT_EVENTS check instead of one of
+// them bypassing it via a raw ipcRenderer.invoke('client-invoke', ...) call.
+const invoke = async <T>(event: ClientEvent): Promise<T> => {
+  if (!ALLOWED_CLIENT_EVENTS.has(event.type)) {
+    console.warn('[Preload] Blocked unauthorized invoke type:', event.type);
+    throw new Error(`Unauthorized event type: ${event.type}`);
+  }
+  console.log('[Preload] Invoking:', event.type);
+  return ipcRenderer.invoke('client-invoke', event);
+};
 
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
@@ -107,13 +125,34 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
 
   // Invoke and wait for response
-  invoke: async <T>(event: ClientEvent): Promise<T> => {
-    if (!ALLOWED_CLIENT_EVENTS.has(event.type)) {
-      console.warn('[Preload] Blocked unauthorized invoke type:', event.type);
-      throw new Error(`Unauthorized event type: ${event.type}`);
-    }
-    console.log('[Preload] Invoking:', event.type);
-    return ipcRenderer.invoke('client-invoke', event);
+  invoke,
+
+  // Session compaction and context usage
+  session: {
+    compact: (
+      sessionId: string,
+      customInstructions?: string
+    ): Promise<{
+      summary: string;
+      firstKeptEntryId: string;
+      tokensBefore: number;
+      details?: unknown;
+    } | null> =>
+      invoke({
+        type: 'session.compact',
+        payload: { sessionId, customInstructions },
+      }),
+    getContextUsage: (
+      sessionId: string
+    ): Promise<{
+      tokens: number | null;
+      contextWindow: number;
+      percent: number | null;
+    } | null> =>
+      invoke({
+        type: 'session.getContextUsage',
+        payload: { sessionId },
+      }),
   },
 
   // Platform info
@@ -198,6 +237,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // MCP methods
   mcp: {
     getServers: (): Promise<McpServerConfig[]> => ipcRenderer.invoke('mcp.getServers'),
+    getServersForSettings: (): Promise<McpServerConfig[]> =>
+      ipcRenderer.invoke('mcp.getServersForSettings'),
     getServer: (serverId: string): Promise<McpServerConfig | undefined> =>
       ipcRenderer.invoke('mcp.getServer', serverId),
     saveServer: (config: McpServerConfig): Promise<{ success: boolean; error?: string }> =>
@@ -407,11 +448,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('schedule.delete', id),
     toggle: (id: string, enabled: boolean): Promise<ScheduleTask | null> =>
       ipcRenderer.invoke('schedule.toggle', id, enabled),
-    runNow: (id: string): Promise<ScheduleTask | null> => ipcRenderer.invoke('schedule.runNow', id),
+    runNow: (id: string): Promise<ScheduleRunNowResult | null> =>
+      ipcRenderer.invoke('schedule.runNow', id),
   },
 
   memory: {
-    getOverview: (cwd?: string): Promise<MemoryOverview> => ipcRenderer.invoke('memory.getOverview', cwd),
+    getOverview: (cwd?: string): Promise<MemoryOverview> =>
+      ipcRenderer.invoke('memory.getOverview', cwd),
     search: (payload: {
       query: string;
       cwd?: string;
@@ -424,7 +467,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('memory.rebuildWorkspace', cwd),
     clearWorkspace: (cwd: string): Promise<{ success: boolean; workspaceKey: string }> =>
       ipcRenderer.invoke('memory.clearWorkspace', cwd),
-    clearCoreMemory: (): Promise<{ success: boolean }> => ipcRenderer.invoke('memory.clearCoreMemory'),
+    clearCoreMemory: (): Promise<{ success: boolean }> =>
+      ipcRenderer.invoke('memory.clearCoreMemory'),
+    getCoreEntries: (): Promise<CoreMemoryListEntry[]> =>
+      ipcRenderer.invoke('memory.getCoreEntries'),
+    writeCoreEntry: (combinedKey: string, value: string): Promise<CoreMemoryListEntry[]> =>
+      ipcRenderer.invoke('memory.writeCoreEntry', combinedKey, value),
+    forgetCoreEntry: (combinedKey: string): Promise<CoreMemoryListEntry[]> =>
+      ipcRenderer.invoke('memory.forgetCoreEntry', combinedKey),
+    forgetSession: (sessionId: string): Promise<void> =>
+      ipcRenderer.invoke('memory.forgetSession', sessionId),
     rebuildAll: (): Promise<{ success: boolean; workspaceCount: number; sessionCount: number }> =>
       ipcRenderer.invoke('memory.rebuildAll'),
     listFiles: (): Promise<MemoryDebugFileInfo[]> => ipcRenderer.invoke('memory.listFiles'),
@@ -447,6 +499,22 @@ declare global {
       send: (event: ClientEvent) => void;
       on: (callback: (event: ServerEvent) => void) => () => void;
       invoke: <T>(event: ClientEvent) => Promise<T>;
+      session: {
+        compact: (
+          sessionId: string,
+          customInstructions?: string
+        ) => Promise<{
+          summary: string;
+          firstKeptEntryId: string;
+          tokensBefore: number;
+          details?: unknown;
+        } | null>;
+        getContextUsage: (sessionId: string) => Promise<{
+          tokens: number | null;
+          contextWindow: number;
+          percent: number | null;
+        } | null>;
+      };
       platform: NodeJS.Platform;
       getSystemTheme: () => Promise<{ shouldUseDarkColors: boolean }>;
       getVersion: () => Promise<string>;
@@ -488,6 +556,7 @@ declare global {
       };
       mcp: {
         getServers: () => Promise<McpServerConfig[]>;
+        getServersForSettings: () => Promise<McpServerConfig[]>;
         getServer: (serverId: string) => Promise<McpServerConfig | undefined>;
         saveServer: (config: McpServerConfig) => Promise<{ success: boolean; error?: string }>;
         deleteServer: (serverId: string) => Promise<{ success: boolean }>;
@@ -650,7 +719,7 @@ declare global {
         update: (id: string, updates: ScheduleUpdateInput) => Promise<ScheduleTask | null>;
         delete: (id: string) => Promise<{ success: boolean }>;
         toggle: (id: string, enabled: boolean) => Promise<ScheduleTask | null>;
-        runNow: (id: string) => Promise<ScheduleTask | null>;
+        runNow: (id: string) => Promise<ScheduleRunNowResult | null>;
       };
       memory: {
         getOverview: (cwd?: string) => Promise<MemoryOverview>;
@@ -665,7 +734,15 @@ declare global {
         rebuildWorkspace: (cwd: string) => Promise<{ success: boolean; workspaceKey: string }>;
         clearWorkspace: (cwd: string) => Promise<{ success: boolean; workspaceKey: string }>;
         clearCoreMemory: () => Promise<{ success: boolean }>;
-        rebuildAll: () => Promise<{ success: boolean; workspaceCount: number; sessionCount: number }>;
+        getCoreEntries: () => Promise<CoreMemoryListEntry[]>;
+        writeCoreEntry: (combinedKey: string, value: string) => Promise<CoreMemoryListEntry[]>;
+        forgetCoreEntry: (combinedKey: string) => Promise<CoreMemoryListEntry[]>;
+        forgetSession: (sessionId: string) => Promise<void>;
+        rebuildAll: () => Promise<{
+          success: boolean;
+          workspaceCount: number;
+          sessionCount: number;
+        }>;
         listFiles: () => Promise<MemoryDebugFileInfo[]>;
         readFile: (filePath: string) => Promise<MemoryDebugFileContent>;
         inspectSession: (

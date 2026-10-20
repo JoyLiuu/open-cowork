@@ -12,6 +12,7 @@
  * Dependencies: session-manager, config-store, mcp-manager, sandbox-adapter,
  *               skills-manager, scheduled-task-manager, nav-server, remote-manager
  */
+import './agent/install-image-resize-reporting';
 import { app, BrowserWindow, ipcMain, dialog, shell, Menu, nativeTheme, Tray } from 'electron';
 import { join, resolve, dirname, isAbsolute, basename } from 'path';
 import * as fs from 'fs';
@@ -24,6 +25,9 @@ import { PluginCatalogService } from './skills/plugin-catalog-service';
 import { PluginRuntimeService } from './skills/plugin-runtime-service';
 import { MemoryService } from './memory/memory-service';
 import { MemoryExtension } from './memory/memory-extension';
+import { ConfigExtension } from './config/config-extension';
+import { SubagentExtension } from './agent/subagent-extension';
+import { TodoExtension } from './agent/todo-extension';
 import { AgentRuntimeExtensionManager } from './extensions/agent-runtime-extension-manager';
 import {
   configStore,
@@ -32,9 +36,15 @@ import {
   type AppTheme,
   type CreateConfigSetPayload,
 } from './config/config-store';
+import { buildAgentRuntimeSignature } from './config/agent-runtime-signature';
+import {
+  startConfigFileWatcher,
+  stopConfigFileWatcher,
+  exportOnConfigChange,
+} from './config/config-file-watcher';
 import { runConfigApiTest } from './config/config-test-routing';
 import { listOllamaModels } from './config/ollama-api';
-import { setPermissionRules } from './config/permission-rules-store';
+import { setPermissionRules, decidePermission } from './config/permission-rules-store';
 import { mcpConfigStore } from './mcp/mcp-config-store';
 import { getSandboxAdapter, shutdownSandbox } from './sandbox/sandbox-adapter';
 import { SandboxSync } from './sandbox/sandbox-sync';
@@ -61,6 +71,7 @@ import {
   type ScheduledTaskUpdateInput,
 } from './schedule/scheduled-task-manager';
 import { createScheduledTaskStore } from './schedule/scheduled-task-store';
+import { checkLocalCondition } from './schedule/local-condition-checker';
 import {
   buildScheduledTaskFallbackTitle,
   buildScheduledTaskTitle,
@@ -87,6 +98,16 @@ import {
 } from './utils/logger';
 import { listRecentWorkspaceFiles } from './utils/recent-workspace-files';
 import { buildDiagnosticsSummary } from './utils/diagnostics-summary';
+import {
+  parseHeadlessArgs,
+  redirectConsoleToStderr,
+  createHeadlessSendToRenderer,
+  emitSessionStarted,
+  emitSessionEnded,
+  emitHeadlessReady,
+  readStdinPrompt,
+  startRpcLoop,
+} from './cli/headless-io';
 
 // Current working directory (persisted between sessions)
 let currentWorkingDir: string | null = null;
@@ -117,6 +138,36 @@ let pluginRuntimeService: PluginRuntimeService | null = null;
 let memoryService: MemoryService | null = null;
 let scheduledTaskManager: ScheduledTaskManager | null = null;
 
+/**
+ * Tool names that a spawned subagent may never invoke, regardless of what
+ * `decidePermission` returns. Subagents run non-interactively — there is no
+ * user present to answer a permission prompt — so for tools whose whole
+ * purpose is to require interactive approval (like `config_write`, which
+ * mutates persisted app configuration), the only safe non-interactive
+ * decision is `deny`. This intentionally overrides even an explicit
+ * `'allow'` permission rule: config writes must always go through the
+ * interactive dialog in the top-level session, never through a background
+ * subagent.
+ */
+const SUBAGENT_ALWAYS_DENIED_TOOLS = new Set<string>(['config_write']);
+
+/**
+ * Resolve the allow/deny decision for a tool call made by a spawned
+ * subagent. Delegates to the shared `decidePermission` rules cache, but
+ * hard-denies tools in `SUBAGENT_ALWAYS_DENIED_TOOLS` first — see that
+ * constant's docstring for why.
+ */
+function resolveSubagentToolPermission(
+  toolName: string,
+  toolInput: Record<string, unknown>
+): 'allow' | 'deny' {
+  if (SUBAGENT_ALWAYS_DENIED_TOOLS.has(toolName)) {
+    return 'deny';
+  }
+  const decision = decidePermission('subagent', toolName, toolInput);
+  return decision === 'deny' ? 'deny' : 'allow';
+}
+
 function sanitizeDiagnosticBaseUrl(value: string | undefined): string | null {
   if (!value) {
     return null;
@@ -128,6 +179,31 @@ function sanitizeDiagnosticBaseUrl(value: string | undefined): string | null {
     return `${parsed.origin}${pathname}`;
   } catch {
     return value.replace(/[?#].*$/, '');
+  }
+}
+
+async function verifyGeminiRuntimeForSmokeTest(): Promise<void> {
+  const { completeSimple, getModel } = await import('@mariozechner/pi-ai');
+  const model = getModel('google', 'gemini-2.5-flash');
+  if (!model) {
+    throw new Error('Gemini smoke-test model is missing from the pi-ai registry');
+  }
+
+  // Abort before dispatch so this loads the packaged Gemini provider and SDK
+  // without sending a network request or requiring a real API key.
+  const controller = new AbortController();
+  controller.abort();
+  const result = await completeSimple(
+    model,
+    {
+      systemPrompt: 'smoke',
+      messages: [{ role: 'user', content: 'smoke', timestamp: Date.now() }],
+    },
+    { apiKey: 'smoke-test-key', signal: controller.signal }
+  );
+
+  if (result.stopReason !== 'aborted') {
+    throw new Error(`Gemini provider smoke test returned ${result.stopReason}`);
   }
 }
 
@@ -677,6 +753,9 @@ async function startSandboxBootstrap(): Promise<void> {
   }
 }
 
+// Pluggable event sender — defaults to mainWindow IPC, swapped for JSONL in headless mode
+let eventSender: ((event: ServerEvent) => void) | null = null;
+
 // 发送事件到渲染进程（含远程会话拦截）
 function sendToRenderer(event: ServerEvent) {
   const payload =
@@ -777,8 +856,10 @@ function sendToRenderer(event: ServerEvent) {
     }
   }
 
-  // 发送到本地 UI
-  if (mainWindow && !mainWindow.isDestroyed()) {
+  // 发送到本地 UI（or headless JSONL sender）
+  if (eventSender) {
+    eventSender(event);
+  } else if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('server-event', event);
   }
 }
@@ -800,13 +881,433 @@ app
         log('[SmokeTest] FAIL: better-sqlite3 failed to load:', e);
         process.exit(1);
       }
+      try {
+        await verifyGeminiRuntimeForSmokeTest();
+        log('[SmokeTest] Gemini provider runtime: OK');
+      } catch (e) {
+        log('[SmokeTest] FAIL: Gemini provider runtime failed to load:', e);
+        process.exit(1);
+      }
       log('[SmokeTest] PASSED');
       process.exit(0);
     }
 
+    // ── Headless mode ──────────────────────────────────────────────────
+    const headlessArgs = parseHeadlessArgs();
+
+    if (headlessArgs.headless) {
+      // Redirect console.log/warn to stderr so stdout stays clean JSONL
+      redirectConsoleToStderr();
+
+      log('[Headless] Starting in headless mode');
+      log('[Headless] Args:', JSON.stringify(headlessArgs));
+
+      if (headlessArgs.autoApprove) {
+        process.stderr.write(
+          '\n⚠️  WARNING: --auto-approve is active. ALL tool calls (file writes, shell commands, network) will be approved without confirmation.\n\n'
+        );
+      }
+
+      // Validate --cwd before proceeding
+      const cwdUnsupported = getWorkspacePathUnsupportedReason(headlessArgs.cwd);
+      if (cwdUnsupported) {
+        process.stderr.write(`Error: --cwd path is invalid: ${cwdUnsupported}\n`);
+        process.exit(1);
+        return;
+      }
+      const fs = await import('fs');
+      if (!fs.existsSync(headlessArgs.cwd)) {
+        process.stderr.write(`Error: --cwd path does not exist: ${headlessArgs.cwd}\n`);
+        process.exit(1);
+        return;
+      }
+
+      // Apply dev logs setting
+      setDevLogsEnabled(configStore.get('enableDevLogs'));
+
+      // Start config file watcher for bidirectional sync
+      startConfigFileWatcher();
+      const db = initDatabase();
+
+      pluginRuntimeService = new PluginRuntimeService(new PluginCatalogService());
+      memoryService = new MemoryService(db);
+      const headlessExtensionManager = new AgentRuntimeExtensionManager([
+        new MemoryExtension(memoryService),
+        new ConfigExtension(configStore),
+        new TodoExtension(),
+        new SubagentExtension(
+          () => sessionManager?.getMCPManager() ?? null,
+          sendToRenderer,
+          async (toolName, toolInput) =>
+            resolveSubagentToolPermission(toolName, toolInput as Record<string, unknown>)
+        ),
+      ]);
+
+      // Build the JSONL sender with permission interception BEFORE constructing SessionManager
+      const headlessSendToRenderer = createHeadlessSendToRenderer();
+      // Mutable interceptor: set in stdio mode to route events to StdioChannel
+      let stdioEventInterceptor: ((event: ServerEvent) => void) | null = null;
+      const headlessSendWithPermission = (event: ServerEvent) => {
+        if (event.type === 'permission.request') {
+          const { toolUseId } = event.payload;
+          const result = headlessArgs.autoApprove ? 'allow' : 'deny';
+          log(
+            `[Headless] Permission ${result} for ${event.payload.toolName} (auto-approve=${headlessArgs.autoApprove})`
+          );
+          setTimeout(() => {
+            sessionManager?.handlePermissionResponse(toolUseId, result);
+          }, 0);
+        }
+        if (event.type === 'sudo.password.request') {
+          const { toolUseId } = event.payload;
+          log('[Headless] Sudo password request denied (headless mode)');
+          setTimeout(() => {
+            sessionManager?.handleSudoPasswordResponse(toolUseId, null);
+          }, 0);
+        }
+        // Route to stdio channel if interceptor is set (must come before headlessSendToRenderer
+        // because headlessSendToRenderer writes JSONL to stdout which conflicts with stdio events)
+        if (stdioEventInterceptor) {
+          stdioEventInterceptor(event);
+          return;
+        }
+        headlessSendToRenderer(event);
+      };
+
+      // Set the global event sender so handleClientEvent's sendToRenderer calls
+      // go through JSONL instead of the null mainWindow
+      eventSender = headlessSendWithPermission;
+
+      sessionManager = new SessionManager(
+        db,
+        headlessSendWithPermission,
+        pluginRuntimeService,
+        headlessExtensionManager
+      );
+
+      skillsManager = new SkillsManager(db, {
+        getConfiguredGlobalSkillsPath: () => configStore.get('globalSkillsPath') || '',
+        setConfiguredGlobalSkillsPath: (nextPath: string) => {
+          configStore.update({ globalSkillsPath: nextPath });
+        },
+        watchStorage: false, // No renderer to notify in headless mode
+      });
+
+      // Set working directory from --cwd flag
+      currentWorkingDir = headlessArgs.cwd;
+      log('[Headless] Working directory:', currentWorkingDir);
+
+      // Initialize scheduled task manager (runs in background)
+      const headlessScheduledTaskStore = createScheduledTaskStore(db);
+      scheduledTaskManager = new ScheduledTaskManager({
+        store: headlessScheduledTaskStore,
+        checkCondition: checkLocalCondition,
+        executeTask: async (task) => {
+          if (!sessionManager) {
+            throw new Error('Session manager not initialized');
+          }
+          const unsupportedReason = getWorkspacePathUnsupportedReason(task.cwd);
+          if (unsupportedReason) {
+            throw new Error(unsupportedReason);
+          }
+          const fallbackTitle = buildScheduledTaskFallbackTitle(task.prompt);
+          const needsRegeneratedTitle = !task.title?.trim() || task.title === fallbackTitle;
+          const title = needsRegeneratedTitle
+            ? await resolveScheduledTaskTitle(task.prompt, task.cwd, task.title)
+            : buildScheduledTaskTitle(task.title);
+          if (title !== task.title) {
+            headlessScheduledTaskStore.update(task.id, { title });
+          }
+          await sessionManager.startSession(title, task.prompt, task.cwd);
+          return { sessionId: '' };
+        },
+        onTaskError: (taskId, error) => {
+          headlessSendWithPermission({
+            type: 'scheduled-task.error',
+            payload: { taskId, error },
+          });
+        },
+        now: () => Date.now(),
+      });
+      scheduledTaskManager.start();
+
+      // Headless cleanup on exit signals
+      const headlessCleanup = async () => {
+        log('[Headless] Cleaning up...');
+        stopConfigFileWatcher();
+        scheduledTaskManager?.stop();
+        try {
+          const mcpManager = sessionManager?.getMCPManager();
+          if (mcpManager) {
+            await mcpManager.shutdown();
+          }
+        } catch (e) {
+          logError('[Headless] MCP shutdown error:', e);
+        }
+        try {
+          closeDatabase();
+        } catch (e) {
+          logError('[Headless] DB close error:', e);
+        }
+        closeLogFile();
+      };
+
+      // Handle SIGTERM/SIGINT for headless mode
+      for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+        process.on(sig, async () => {
+          log(`[Headless] Received ${sig}`);
+          // Stop all active sessions
+          if (sessionManager) {
+            const sessions = sessionManager.listSessions();
+            for (const s of sessions) {
+              if (s.status === 'running') {
+                try {
+                  await sessionManager.stopSession(s.id);
+                } catch {
+                  // Best effort
+                }
+              }
+            }
+          }
+          await headlessCleanup();
+          process.exit(0);
+        });
+      }
+
+      // Helper: wait for a session to reach idle/error state
+      const waitForSessionCompletion = (sessionId: string): Promise<void> =>
+        new Promise((resolve) => {
+          const checkInterval = setInterval(() => {
+            const sessions = sessionManager!.listSessions();
+            const current = sessions.find((s) => s.id === sessionId);
+            if (!current || current.status === 'idle' || current.status === 'error') {
+              clearInterval(checkInterval);
+              resolve();
+            }
+          }, 500);
+          // Clear interval on process exit to avoid firing during cleanup
+          for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+            process.once(sig, () => clearInterval(checkInterval));
+          }
+        });
+
+      if (headlessArgs.prompt) {
+        // ── Single-shot mode: run prompt, stream output, exit ──
+        log('[Headless] Single-shot mode with prompt');
+
+        if (!configStore.hasUsableCredentialsForActiveSet()) {
+          headlessSendWithPermission({
+            type: 'error',
+            payload: {
+              message: 'No usable API credentials configured. Run the GUI to set up API keys.',
+              code: 'CONFIG_REQUIRED_ACTIVE_SET',
+            },
+          });
+          await headlessCleanup();
+          process.exit(1);
+          return;
+        }
+
+        try {
+          const session = await sessionManager.startSession(
+            'Headless Session',
+            headlessArgs.prompt,
+            headlessArgs.cwd
+          );
+          emitSessionStarted(session.id);
+          await waitForSessionCompletion(session.id);
+          emitSessionEnded(session.id);
+          await headlessCleanup();
+          process.exit(0);
+        } catch (err) {
+          logError('[Headless] Session error:', err);
+          headlessSendWithPermission({
+            type: 'error',
+            payload: {
+              message: err instanceof Error ? err.message : String(err),
+            },
+          });
+          await headlessCleanup();
+          process.exit(1);
+        }
+      } else if (headlessArgs.mode === 'rpc') {
+        // ── RPC mode: read ClientEvent JSONL from stdin, keep running ──
+        log('[Headless] RPC mode — reading JSONL from stdin');
+        emitHeadlessReady();
+
+        startRpcLoop(async (event) => {
+          // Guard GUI-only operations in headless mode
+          if (event.type === 'folder.select' || event.type === 'workdir.select') {
+            throw new Error(`${event.type} is not supported in headless mode`);
+          }
+          return handleClientEvent(event);
+        });
+
+        // Process stays alive until stdin closes or signal received
+      } else if (headlessArgs.mode === 'stdio') {
+        // ── Stdio channel mode: session-based RPC via RemoteManager ──
+        log('[Headless] Stdio channel mode');
+
+        if (!configStore.hasUsableCredentialsForActiveSet()) {
+          headlessSendWithPermission({
+            type: 'error',
+            payload: {
+              message: 'No usable API credentials configured. Run the GUI to set up API keys.',
+              code: 'CONFIG_REQUIRED_ACTIVE_SET',
+            },
+          });
+          await headlessCleanup();
+          process.exit(1);
+          return;
+        }
+
+        // Set up RemoteManager with StdioChannel
+        const stdioAgentExecutor: AgentExecutor = {
+          startSession: async (title, prompt, cwd) => {
+            if (!sessionManager) throw new Error('Session manager not initialized');
+            const unsupportedReason = getWorkspacePathUnsupportedReason(cwd);
+            if (unsupportedReason) {
+              throw new Error(unsupportedReason);
+            }
+            return sessionManager.startSession(title, prompt, cwd);
+          },
+          continueSession: async (sessionId, prompt, content) => {
+            if (!sessionManager) throw new Error('Session manager not initialized');
+            await sessionManager.continueSession(sessionId, prompt, content);
+          },
+          stopSession: async (sessionId) => {
+            if (!sessionManager) throw new Error('Session manager not initialized');
+            await sessionManager.stopSession(sessionId);
+          },
+          validateWorkingDirectory: (cwd) => {
+            return getWorkspacePathUnsupportedReason(cwd) || null;
+          },
+          hasSession: (sessionId) => {
+            if (!sessionManager) throw new Error('Session manager not initialized');
+            return sessionManager.hasSession(sessionId);
+          },
+        };
+        remoteManager.setAgentExecutor(stdioAgentExecutor);
+        remoteManager.setRendererCallback(headlessSendWithPermission);
+
+        // Cascade channel-binding cleanup when a session is deleted, so a
+        // deleted channel session cannot leave a stale in-memory binding.
+        headlessExtensionManager.register({
+          name: 'remote-session-binding',
+          onSessionDeleted: async ({ sessionId }) => {
+            await remoteManager.handleSessionDeleted(sessionId);
+          },
+        });
+
+        const stdioChannel = await remoteManager.startStdioMode(headlessArgs.cwd);
+
+        // Set the interceptor so ALL events from SM flow through stdio routing
+        // (fixes the dead-code issue: SM calls headlessSendWithPermission directly,
+        // which now checks stdioEventInterceptor before writing JSONL)
+        stdioEventInterceptor = (event: ServerEvent) => {
+          const payload =
+            'payload' in event
+              ? (event.payload as { sessionId?: string; [key: string]: unknown })
+              : undefined;
+          const sessionId = payload?.sessionId;
+
+          if (sessionId && remoteManager.isRemoteSession(sessionId)) {
+            if (event.type === 'stream.partial') {
+              stdioChannel.writeEvent({
+                type: 'agent.text_delta',
+                sessionId,
+                text: (payload.delta as string) || '',
+              });
+            } else if (event.type === 'trace.step') {
+              const step = payload.step as {
+                type?: string;
+                toolName?: string;
+                status?: string;
+                title?: string;
+                input?: unknown;
+                output?: string;
+              };
+              if (step?.type === 'tool_call' && step?.toolName) {
+                if (step.status === 'running') {
+                  stdioChannel.writeToolStart(sessionId, step.toolName, step.input || {});
+                } else if (step.status === 'completed' || step.status === 'error') {
+                  stdioChannel.writeToolEnd(sessionId, step.toolName, step.output || '');
+                }
+              }
+            } else if (event.type === 'session.status') {
+              const status = payload.status as string;
+              if (status === 'running') {
+                stdioChannel.writeSessionStarted(sessionId);
+              } else if (status === 'idle' || status === 'error') {
+                stdioChannel.writeSessionEnd(sessionId);
+                remoteManager.clearSessionBuffer(sessionId).catch(() => {});
+              }
+            }
+            // permission.request is already handled by headlessSendWithPermission above
+          }
+        };
+
+        // Notify that session.started events should come through the channel
+        // The StdioChannel's onMessage triggers the MessageRouter which calls
+        // remoteManager.executeAgent → sessionManager.startSession. When the session
+        // is created, the remoteManager will call back writeSessionStarted via
+        // its session mapping.
+
+        // Process stays alive until stdin closes or signal received
+      } else {
+        // No prompt and not RPC mode — try reading from stdin pipe
+        log('[Headless] Attempting to read prompt from stdin');
+        const stdinPrompt = await readStdinPrompt();
+        if (stdinPrompt) {
+          if (!configStore.hasUsableCredentialsForActiveSet()) {
+            headlessSendWithPermission({
+              type: 'error',
+              payload: {
+                message: 'No usable API credentials configured.',
+                code: 'CONFIG_REQUIRED_ACTIVE_SET',
+              },
+            });
+            await headlessCleanup();
+            process.exit(1);
+            return;
+          }
+
+          try {
+            const session = await sessionManager.startSession(
+              'Headless Session',
+              stdinPrompt,
+              headlessArgs.cwd
+            );
+            emitSessionStarted(session.id);
+            await waitForSessionCompletion(session.id);
+            emitSessionEnded(session.id);
+            await headlessCleanup();
+            process.exit(0);
+          } catch (err) {
+            logError('[Headless] Session error:', err);
+            await headlessCleanup();
+            process.exit(1);
+          }
+        } else {
+          process.stderr.write(
+            'Error: --headless requires either -p "prompt", --mode rpc, or piped stdin\n'
+          );
+          await headlessCleanup();
+          process.exit(1);
+        }
+      }
+
+      return; // Skip all GUI initialization below
+    }
+
+    // ── GUI mode (default) ─────────────────────────────────────────────
+
     // Apply dev logs setting from config
     const enableDevLogs = configStore.get('enableDevLogs');
     setDevLogsEnabled(enableDevLogs);
+
+    // Start config file watcher for bidirectional sync
+    startConfigFileWatcher();
 
     // Log environment variables for debugging
     log('=== Open Cowork Starting ===');
@@ -818,7 +1319,7 @@ app
     log('  ANTHROPIC_AUTH_TOKEN:', process.env.ANTHROPIC_AUTH_TOKEN ? '✓ Set' : '✗ Not set');
     log('  ANTHROPIC_BASE_URL:', process.env.ANTHROPIC_BASE_URL || '(not set)');
     log('  CLAUDE_MODEL:', process.env.CLAUDE_MODEL || '(not set)');
-    log('  CLAUDE_CODE_PATH:', process.env.CLAUDE_CODE_PATH || '(not set)');
+    log('  AGENT_CLI_PATH:', process.env.AGENT_CLI_PATH || '(not set)');
     log('  OPENAI_API_KEY:', process.env.OPENAI_API_KEY ? '✓ Set' : '✗ Not set');
     log('  OPENAI_BASE_URL:', process.env.OPENAI_BASE_URL || '(not set)');
     log('  OPENAI_MODEL:', process.env.OPENAI_MODEL || '(not set)');
@@ -833,10 +1334,32 @@ app
 
     // Initialize database
     const db = initDatabase();
+    // A run does not outlive its process, so a session still marked running was left by an earlier
+    // launch, but only when no other process can be running it. A dev run takes no single-instance
+    // lock, and a second instance that lost the lock is on its way out but still reaches this point.
+    if (!isDev && hasSingleInstanceLock) {
+      const interruptedSessions = db.sessions.markRunningIdle();
+      if (interruptedSessions > 0) {
+        log(
+          '[App] Marked sessions left running by the previous launch as idle:',
+          interruptedSessions
+        );
+      }
+    }
 
     pluginRuntimeService = new PluginRuntimeService(new PluginCatalogService());
     memoryService = new MemoryService(db);
-    const extensionManager = new AgentRuntimeExtensionManager([new MemoryExtension(memoryService)]);
+    const extensionManager = new AgentRuntimeExtensionManager([
+      new MemoryExtension(memoryService),
+      new ConfigExtension(configStore),
+      new TodoExtension(),
+      new SubagentExtension(
+        () => sessionManager?.getMCPManager() ?? null,
+        sendToRenderer,
+        async (toolName, toolInput) =>
+          resolveSubagentToolPermission(toolName, toolInput as Record<string, unknown>)
+      ),
+    ]);
 
     // Initialize session manager before creating an interactive window.
     // This avoids session.start racing the startup path and hitting a null manager.
@@ -918,6 +1441,7 @@ app
     const scheduledTaskStore = createScheduledTaskStore(db);
     scheduledTaskManager = new ScheduledTaskManager({
       store: scheduledTaskStore,
+      checkCondition: checkLocalCondition,
       executeTask: async (task) => {
         if (!sessionManager) {
           throw new Error('Session manager not initialized');
@@ -987,8 +1511,22 @@ app
         }
         return null;
       },
+      hasSession: (sessionId) => {
+        if (!sessionManager) throw new Error('Session manager not initialized');
+        return sessionManager.hasSession(sessionId);
+      },
     };
     remoteManager.setAgentExecutor(agentExecutor);
+
+    // Cascade channel-binding cleanup when a session is deleted from the
+    // desktop UI, so a deleted channel session cannot leave a stale in-memory
+    // binding (channel would otherwise keep failing until restart).
+    extensionManager.register({
+      name: 'remote-session-binding',
+      onSessionDeleted: async ({ sessionId }) => {
+        await remoteManager.handleSessionDeleted(sessionId);
+      },
+    });
 
     // 远程控制启用时启动
     if (remoteConfigStore.isEnabled()) {
@@ -1042,6 +1580,7 @@ async function cleanupSandboxResources(): Promise<void> {
   isCleaningUp = true;
 
   stopNavServer();
+  stopConfigFileWatcher();
   skillsManager?.stopStorageMonitoring();
   scheduledTaskManager?.stop();
   tray?.destroy();
@@ -1105,6 +1644,10 @@ async function cleanupSandboxResources(): Promise<void> {
 
 // Handle app quit - window-all-closed (primary for Windows/Linux)
 app.on('window-all-closed', async () => {
+  // In headless mode there are no windows, so this event fires immediately.
+  // The headless path manages its own lifecycle — skip cleanup here.
+  if (process.argv.includes('--headless')) return;
+
   if (process.platform !== 'darwin' || process.env.VITE_DEV_SERVER_URL) {
     // On Windows/Linux, closing all windows means quit.
     // On macOS dev mode, also quit — so vite-plugin-electron can restart cleanly
@@ -1408,18 +1951,6 @@ ipcMain.handle('config.getPresets', () => {
   }
 });
 
-const buildAgentRuntimeSignature = (config: AppConfig): string =>
-  JSON.stringify({
-    provider: config.provider,
-    apiKey: config.apiKey,
-    baseUrl: config.baseUrl,
-    customProtocol: config.customProtocol,
-    model: config.model,
-    enableThinking: config.enableThinking,
-    memoryEnabled: config.memoryEnabled,
-    memoryRuntime: config.memoryRuntime,
-  });
-
 const syncConfigAfterMutation = async (previousConfig: AppConfig) => {
   // Mark as configured if any config set has usable credentials
   configStore.set('isConfigured', configStore.hasAnyUsableCredentials());
@@ -1459,6 +1990,10 @@ const syncConfigAfterMutation = async (previousConfig: AppConfig) => {
     },
   });
   log('[Config] Notified renderer of config update, isConfigured:', isConfigured);
+
+  // Sync plaintext config file with updated safe fields
+  exportOnConfigChange();
+
   return updatedConfig;
 };
 
@@ -1580,13 +2115,51 @@ ipcMain.handle('config.discover-local', async (_event, payload?: { baseUrl?: str
   }
 });
 
+// Config file export/import IPC handlers
+ipcMain.handle('config.exportFile', () => {
+  try {
+    exportOnConfigChange();
+    return { success: true, path: configStore.getPublicConfigPath() };
+  } catch (error) {
+    logError('[Config] Error exporting config file:', error);
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+});
+
+ipcMain.handle('config.importFile', async () => {
+  try {
+    const previousConfig = configStore.getAll();
+    const imported = configStore.importSafeConfig();
+    if (imported) {
+      await syncConfigAfterMutation(previousConfig);
+    }
+    return { success: true, imported };
+  } catch (error) {
+    logError('[Config] Error importing config file:', error);
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+});
+
+ipcMain.handle('config.getPublicPath', () => {
+  try {
+    return configStore.getPublicConfigPath();
+  } catch (error) {
+    logError('[Config] Error getting public config path:', error);
+    return null;
+  }
+});
+
 // MCP Server IPC handlers
 ipcMain.handle('mcp.getServers', () => {
+  return mcpConfigStore.getServers();
+});
+
+ipcMain.handle('mcp.getServersForSettings', () => {
   try {
-    return mcpConfigStore.getServers();
+    return mcpConfigStore.getServersForSettings();
   } catch (error) {
     logError('[MCP] Error getting servers:', error);
-    return [];
+    throw error;
   }
 });
 
@@ -2082,7 +2655,7 @@ ipcMain.handle('logs.export', async () => {
         sandboxEnabled: !!configStore.get('sandboxEnabled'),
         thinkingEnabled: !!configStore.get('enableThinking'),
         apiKeyConfigured: !!configStore.get('apiKey'),
-        claudeCodePathConfigured: !!configStore.get('claudeCodePath'),
+        agentCliPathConfigured: !!configStore.get('agentCliPath'),
         defaultWorkdir: configStore.get('defaultWorkdir') || null,
         globalSkillsPathConfigured: !!configStore.get('globalSkillsPath'),
       },
@@ -2377,9 +2950,9 @@ ipcMain.handle('remote.getRemoteSessions', () => {
   }
 });
 
-ipcMain.handle('remote.clearRemoteSession', (_event, sessionId: string) => {
+ipcMain.handle('remote.clearRemoteSession', async (_event, sessionId: string) => {
   try {
-    const success = remoteManager.clearRemoteSession(sessionId);
+    const success = await remoteManager.clearRemoteSession(sessionId);
     return { success };
   } catch (error) {
     logError('[Remote] Error clearing remote session:', error);
@@ -2545,6 +3118,34 @@ ipcMain.handle('memory.clearCoreMemory', () => {
     throw new Error('Memory service not initialized');
   }
   return memoryService.clearCoreMemory();
+});
+
+ipcMain.handle('memory.getCoreEntries', () => {
+  if (!memoryService) {
+    throw new Error('Memory service not initialized');
+  }
+  return memoryService.getCoreEntries();
+});
+
+ipcMain.handle('memory.writeCoreEntry', (_event, combinedKey: string, value: string) => {
+  if (!memoryService) {
+    throw new Error('Memory service not initialized');
+  }
+  return memoryService.writeCoreEntry(combinedKey, value);
+});
+
+ipcMain.handle('memory.forgetCoreEntry', (_event, combinedKey: string) => {
+  if (!memoryService) {
+    throw new Error('Memory service not initialized');
+  }
+  return memoryService.forgetCoreEntry(combinedKey);
+});
+
+ipcMain.handle('memory.forgetSession', (_event, sessionId: string) => {
+  if (!memoryService) {
+    throw new Error('Memory service not initialized');
+  }
+  return memoryService.forgetSession(sessionId);
 });
 
 ipcMain.handle('memory.rebuildAll', async () => {
@@ -2713,6 +3314,9 @@ async function handleClientEvent(event: ClientEvent): Promise<unknown> {
     case 'session.delete':
       return sm.deleteSession(event.payload.sessionId);
 
+    case 'session.rename':
+      return sm.renameSession(event.payload.sessionId, event.payload.title);
+
     case 'session.batchDelete':
       return sm.batchDeleteSessions(event.payload.sessionIds);
 
@@ -2727,6 +3331,12 @@ async function handleClientEvent(event: ClientEvent): Promise<unknown> {
 
     case 'session.getTraceSteps':
       return sm.getTraceSteps(event.payload.sessionId);
+
+    case 'session.compact':
+      return sm.compactSession(event.payload.sessionId, event.payload.customInstructions);
+
+    case 'session.getContextUsage':
+      return sm.getContextUsage(event.payload.sessionId);
 
     case 'permission.response':
       return sm.handlePermissionResponse(event.payload.toolUseId, event.payload.result);

@@ -10,6 +10,7 @@ import type {
   TraceStep,
   ContentBlock,
 } from '../types';
+import { handleSubagentProgressEvent } from './useSubagentProgress';
 import i18n from '../i18n/config';
 
 // Check if running in Electron
@@ -139,6 +140,9 @@ export function useIPC() {
           case 'session.status':
             store.updateSession(event.payload.sessionId, {
               status: event.payload.status,
+              ...(event.payload.updatedAt !== undefined
+                ? { updatedAt: event.payload.updatedAt }
+                : {}),
             });
             if (event.payload.status !== 'running') {
               store.finishExecutionClock(event.payload.sessionId);
@@ -320,6 +324,26 @@ export function useIPC() {
               store.setShowSettings(true);
             }
             break;
+
+          case 'subagent.progress':
+            handleSubagentProgressEvent(event.payload);
+            break;
+
+          case 'compaction.result': {
+            const { sessionId, summary, tokensBefore, readFiles, modifiedFiles, isManual } =
+              event.payload;
+            store.addCompactionEvent(sessionId, {
+              id: `compact-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              timestamp: Date.now(),
+              tokensBefore,
+              tokensAfter: null,
+              summary,
+              readFiles,
+              modifiedFiles,
+              type: isManual ? 'manual' : 'auto',
+            });
+            break;
+          }
 
           default:
             console.log('[useIPC] Unknown server event:', event);
@@ -684,6 +708,30 @@ export function useIPC() {
     [send]
   );
 
+  const renameSession = useCallback(
+    async (session: Session, title: string) => {
+      useAppStore.getState().updateSession(session.id, { title });
+      if (!isElectron) return;
+      try {
+        await invoke({ type: 'session.rename', payload: { sessionId: session.id, title } });
+      } catch (error) {
+        console.error('[useIPC] Failed to rename session:', session.id, error);
+        const store = useAppStore.getState();
+        // A later rename or an authoritative session.update may have replaced
+        // this title; only undo the value this call wrote.
+        if (store.sessions.find((item) => item.id === session.id)?.title !== title) return;
+        store.updateSession(session.id, { title: session.title });
+        store.setGlobalNotice({
+          id: `notice-rename-failed-${Date.now()}`,
+          type: 'error',
+          message: i18n.t('sidebar.renameFailed'),
+          messageKey: 'sidebar.renameFailed',
+        });
+      }
+    },
+    [invoke]
+  );
+
   const batchDeleteSessions = useCallback(
     (sessionIds: string[]) => {
       useAppStore.getState().removeSessions(sessionIds);
@@ -798,6 +846,7 @@ export function useIPC() {
     continueSession,
     stopSession,
     deleteSession,
+    renameSession,
     batchDeleteSessions,
     listSessions,
     getSessionMessages,

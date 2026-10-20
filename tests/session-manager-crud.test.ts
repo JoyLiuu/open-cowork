@@ -33,8 +33,8 @@ vi.mock('electron-store', () => {
   return { default: MockStore };
 });
 
-vi.mock('../src/main/claude/agent-runner', () => ({
-  ClaudeAgentRunner: class {
+vi.mock('../src/main/agent/agent-runner', () => ({
+  CoworkAgentRunner: class {
     run = vi.fn();
     cancel = vi.fn();
     handleQuestionResponse = vi.fn();
@@ -108,7 +108,7 @@ describe('SessionManager.listSessions', () => {
         getAll: vi.fn(() => [row]),
         update: vi.fn(),
         delete: vi.fn(),
-      } as any,
+      } as unknown,
     });
 
     const manager = new SessionManager(db, vi.fn());
@@ -149,7 +149,7 @@ describe('SessionManager.listSessions', () => {
         getAll: vi.fn(() => [row]),
         update: vi.fn(),
         delete: vi.fn(),
-      } as any,
+      } as unknown,
     });
 
     const manager = new SessionManager(db, vi.fn());
@@ -181,7 +181,7 @@ describe('SessionManager.getMessages content normalization', () => {
             execution_time_ms: null,
           },
         ]),
-      } as any,
+      } as unknown,
     });
 
     const manager = new SessionManager(db, vi.fn());
@@ -208,7 +208,7 @@ describe('SessionManager.getMessages content normalization', () => {
             execution_time_ms: null,
           },
         ]),
-      } as any,
+      } as unknown,
     });
 
     const manager = new SessionManager(db, vi.fn());
@@ -233,7 +233,7 @@ describe('SessionManager.getMessages content normalization', () => {
             execution_time_ms: null,
           },
         ]),
-      } as any,
+      } as unknown,
     });
 
     const manager = new SessionManager(db, vi.fn());
@@ -258,7 +258,7 @@ describe('SessionManager.getMessages content normalization', () => {
             execution_time_ms: null,
           },
         ]),
-      } as any,
+      } as unknown,
     });
 
     const manager = new SessionManager(db, vi.fn());
@@ -330,7 +330,7 @@ describe('SessionManager.deleteSession cache eviction', () => {
         getAll: vi.fn(() => []),
         update: vi.fn(),
         delete: vi.fn(),
-      } as any,
+      } as unknown,
       messages: {
         create: vi.fn(),
         delete: vi.fn(),
@@ -346,7 +346,7 @@ describe('SessionManager.deleteSession cache eviction', () => {
             execution_time_ms: null,
           },
         ]),
-      } as any,
+      } as unknown,
     });
 
     const manager = new SessionManager(db, vi.fn());
@@ -361,5 +361,68 @@ describe('SessionManager.deleteSession cache eviction', () => {
     // Cache should have been evicted — DB should be hit again on next call
     manager.getMessages('s1');
     expect(db.messages.getBySessionId).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ------------------------------------------------------------------
+// renameSession
+// ------------------------------------------------------------------
+describe('SessionManager.renameSession', () => {
+  function makeSessionDb(existing: { id: string; title: string } | null) {
+    return makeDb({
+      sessions: {
+        create: vi.fn(),
+        get: vi.fn(() => existing),
+        getAll: vi.fn(() => []),
+        update: vi.fn(),
+        delete: vi.fn(),
+      } as unknown,
+    });
+  }
+
+  it('stores the trimmed title and tells the renderer', () => {
+    const db = makeSessionDb({ id: 's1', title: 'Old title' });
+    const sendToRenderer = vi.fn();
+    const manager = new SessionManager(db, sendToRenderer);
+
+    manager.renameSession('s1', '  Quarterly plan  ');
+
+    expect(db.sessions.update).toHaveBeenCalledWith('s1', { title: 'Quarterly plan' });
+    expect(sendToRenderer).toHaveBeenCalledWith({
+      type: 'session.update',
+      payload: { sessionId: 's1', updates: { title: 'Quarterly plan' } },
+    });
+  });
+
+  it('rejects a blank title', () => {
+    const db = makeSessionDb({ id: 's1', title: 'Old title' });
+    const manager = new SessionManager(db, vi.fn());
+
+    expect(() => manager.renameSession('s1', '   ')).toThrow('Session title cannot be empty');
+    expect(db.sessions.update).not.toHaveBeenCalled();
+  });
+
+  it('rejects a title over the length limit or of the wrong type', () => {
+    const db = makeSessionDb({ id: 's1', title: 'Old title' });
+    const manager = new SessionManager(db, vi.fn());
+
+    expect(() => manager.renameSession('s1', 'x'.repeat(201))).toThrow(
+      'Session title cannot exceed 200 characters'
+    );
+    expect(() => manager.renameSession('s1', 42 as unknown as string)).toThrow(
+      'Session title cannot be empty'
+    );
+    manager.renameSession('s1', 'x'.repeat(200));
+    expect(db.sessions.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a deleted session', () => {
+    const db = makeSessionDb(null);
+    const sendToRenderer = vi.fn();
+    const manager = new SessionManager(db, sendToRenderer);
+
+    expect(() => manager.renameSession('gone', 'New title')).toThrow('Session not found: gone');
+    expect(db.sessions.update).not.toHaveBeenCalled();
+    expect(sendToRenderer).not.toHaveBeenCalled();
   });
 });

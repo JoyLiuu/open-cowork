@@ -1,3 +1,9 @@
+import type {
+  LocalWatchConfig,
+  ScheduledTaskRunOutcome,
+} from '../../shared/schedule/local-watch-task';
+import type { SubagentConfig } from '../../shared/subagent-config';
+
 // Session types
 export interface Session {
   id: string;
@@ -83,8 +89,8 @@ export interface ToolResultContent {
   content: string;
   isError?: boolean;
   images?: Array<{
-    data: string;          // base64 encoded image data
-    mimeType: string;      // e.g., 'image/png'
+    data: string; // base64 encoded image data
+    mimeType: string; // e.g., 'image/png'
   }>;
 }
 
@@ -133,6 +139,11 @@ export interface WeeklyScheduleConfig {
 export type ScheduleConfig = DailyScheduleConfig | WeeklyScheduleConfig;
 
 export interface ScheduleTask {
+  watchConfig?: LocalWatchConfig | null;
+  watchConfigError?: string | null;
+  lastState?: string | null;
+  lastCheckedAt?: number | null;
+  consecutiveUnchanged?: number;
   id: string;
   title: string;
   prompt: string;
@@ -151,6 +162,7 @@ export interface ScheduleTask {
 }
 
 export interface ScheduleCreateInput {
+  watchConfig?: LocalWatchConfig | null;
   title?: string;
   prompt: string;
   cwd: string;
@@ -163,6 +175,7 @@ export interface ScheduleCreateInput {
 }
 
 export interface ScheduleUpdateInput {
+  watchConfig?: LocalWatchConfig | null;
   title?: string;
   prompt?: string;
   cwd?: string;
@@ -172,9 +185,11 @@ export interface ScheduleUpdateInput {
   repeatEvery?: number | null;
   repeatUnit?: ScheduleRepeatUnit | null;
   enabled?: boolean;
-  lastRunAt?: number | null;
-  lastRunSessionId?: string | null;
-  lastError?: string | null;
+}
+
+export interface ScheduleRunNowResult {
+  task: ScheduleTask;
+  outcome: ScheduledTaskRunOutcome;
 }
 
 // Skills types
@@ -355,6 +370,15 @@ export interface MemoryInspectSessionResult {
   chunks: ChunkMemoryItem[];
 }
 
+export interface CoreMemoryListEntry {
+  combinedKey: string;
+  category?: 'identity' | 'preferences' | 'skills' | 'interests';
+  key: string;
+  value: string;
+  /** Written by the user in Settings; extraction and rebuild keep it as is. */
+  userWritten: boolean;
+}
+
 export interface MemoryOverview {
   enabled: boolean;
   storageRoot: string;
@@ -466,10 +490,16 @@ export type ClientEvent =
     }
   | { type: 'session.stop'; payload: { sessionId: string } }
   | { type: 'session.delete'; payload: { sessionId: string } }
+  | { type: 'session.rename'; payload: { sessionId: string; title: string } }
   | { type: 'session.batchDelete'; payload: { sessionIds: string[] } }
   | { type: 'session.list'; payload: Record<string, never> }
   | { type: 'session.getMessages'; payload: { sessionId: string } }
   | { type: 'session.getTraceSteps'; payload: { sessionId: string } }
+  | {
+      type: 'session.compact';
+      payload: { sessionId: string; customInstructions?: string };
+    }
+  | { type: 'session.getContextUsage'; payload: { sessionId: string } }
   | { type: 'permission.response'; payload: { toolUseId: string; result: PermissionResult } }
   | { type: 'sudo.password.response'; payload: { toolUseId: string; password: string | null } }
   | { type: 'settings.update'; payload: Record<string, unknown> }
@@ -479,17 +509,17 @@ export type ClientEvent =
   | { type: 'workdir.select'; payload: { sessionId?: string; currentPath?: string } };
 
 // Sandbox setup types (app startup)
-export type SandboxSetupPhase = 
-  | 'checking'      // Checking WSL/Lima availability
-  | 'creating'      // Creating Lima instance (macOS only)
-  | 'starting'      // Starting Lima instance (macOS only)  
+export type SandboxSetupPhase =
+  | 'checking' // Checking WSL/Lima availability
+  | 'creating' // Creating Lima instance (macOS only)
+  | 'starting' // Starting Lima instance (macOS only)
   | 'installing_node' // Installing Node.js
   | 'installing_python' // Installing Python
-  | 'installing_pip'    // Installing pip
-  | 'installing_deps'   // Installing skill dependencies (markitdown, pypdf, etc.)
-  | 'ready'         // Ready to use
-  | 'skipped'       // No sandbox needed (native mode)
-  | 'error';        // Setup failed
+  | 'installing_pip' // Installing pip
+  | 'installing_deps' // Installing skill dependencies (markitdown, pypdf, etc.)
+  | 'ready' // Ready to use
+  | 'skipped' // No sandbox needed (native mode)
+  | 'error'; // Setup failed
 
 export interface SandboxSetupProgress {
   phase: SandboxSetupPhase;
@@ -501,11 +531,11 @@ export interface SandboxSetupProgress {
 
 // Sandbox sync types (per-session file sync)
 export type SandboxSyncPhase =
-  | 'starting_agent'  // Starting WSL/Lima agent
-  | 'syncing_files'   // Syncing files to sandbox
+  | 'starting_agent' // Starting WSL/Lima agent
+  | 'syncing_files' // Syncing files to sandbox
   | 'syncing_skills' // Copying skills
-  | 'ready'           // Sync complete
-  | 'error';          // Sync failed
+  | 'ready' // Sync complete
+  | 'error'; // Sync failed
 
 export interface SandboxSyncStatus {
   sessionId: string;
@@ -520,8 +550,14 @@ export type ServerEvent =
   | { type: 'stream.message'; payload: { sessionId: string; message: Message } }
   | { type: 'stream.partial'; payload: { sessionId: string; delta: string } }
   | { type: 'stream.thinking'; payload: { sessionId: string; delta: string } }
-  | { type: 'stream.executionTime'; payload: { sessionId: string; messageId: string; executionTimeMs: number } }
-  | { type: 'session.status'; payload: { sessionId: string; status: SessionStatus; error?: string } }
+  | {
+      type: 'stream.executionTime';
+      payload: { sessionId: string; messageId: string; executionTimeMs: number };
+    }
+  | {
+      type: 'session.status';
+      payload: { sessionId: string; status: SessionStatus; error?: string; updatedAt?: number };
+    }
   | { type: 'session.update'; payload: { sessionId: string; updates: Partial<Session> } }
   | { type: 'session.list'; payload: { sessions: Session[] } }
   | { type: 'permission.request'; payload: PermissionRequest }
@@ -529,21 +565,62 @@ export type ServerEvent =
   | { type: 'sudo.password.request'; payload: SudoPasswordRequest }
   | { type: 'sudo.password.dismiss'; payload: { toolUseId: string } }
   | { type: 'trace.step'; payload: { sessionId: string; step: TraceStep } }
-  | { type: 'trace.update'; payload: { sessionId: string; stepId: string; updates: Partial<TraceStep> } }
+  | {
+      type: 'trace.update';
+      payload: { sessionId: string; stepId: string; updates: Partial<TraceStep> };
+    }
   | { type: 'folder.selected'; payload: { path: string } }
   | { type: 'config.status'; payload: { isConfigured: boolean; config: AppConfig } }
   | { type: 'sandbox.progress'; payload: SandboxSetupProgress }
   | { type: 'sandbox.sync'; payload: SandboxSyncStatus }
   | { type: 'skills.storageChanged'; payload: SkillsStorageChangeEvent }
-  | { type: 'plugins.runtimeApplied'; payload: { sessionId: string; plugins: Array<{ name: string; path: string }> } }
+  | {
+      type: 'plugins.runtimeApplied';
+      payload: { sessionId: string; plugins: Array<{ name: string; path: string }> };
+    }
   | { type: 'workdir.changed'; payload: { path: string } }
   | { type: 'session.contextInfo'; payload: { sessionId: string; contextWindow: number } }
-  | { type: 'navigate.to'; payload: { page: 'welcome' | 'settings' | 'session'; tab?: string; sessionId?: string } }
+  | {
+      type: 'compaction.result';
+      payload: {
+        sessionId: string;
+        summary: string;
+        tokensBefore: number;
+        isManual?: boolean;
+        readFiles: string[];
+        modifiedFiles: string[];
+      };
+    }
+  | {
+      type: 'subagent.progress';
+      payload: {
+        parentSessionId: string;
+        subagentId: string;
+        event: 'started' | 'tool_start' | 'tool_end' | 'text_delta' | 'completed' | 'failed';
+        task?: string;
+        toolName?: string;
+        isError?: boolean;
+        text?: string;
+        error?: string;
+        durationMs?: number;
+      };
+    }
+  | {
+      type: 'navigate.to';
+      payload: { page: 'welcome' | 'settings' | 'session'; tab?: string; sessionId?: string };
+    }
   | { type: 'native-theme.changed'; payload: { shouldUseDarkColors: boolean } }
   | { type: 'new-session' }
   | { type: 'navigate'; payload: string }
   | { type: 'scheduled-task.error'; payload: { taskId: string; error: string } }
-  | { type: 'error'; payload: { message: string; code?: 'CONFIG_REQUIRED_ACTIVE_SET'; action?: 'open_api_settings' } };
+  | {
+      type: 'error';
+      payload: {
+        message: string;
+        code?: 'CONFIG_REQUIRED_ACTIVE_SET';
+        action?: 'open_api_settings';
+      };
+    };
 
 // Settings types
 export interface Settings {
@@ -557,7 +634,15 @@ export interface Settings {
 }
 
 // Tool types
-export type ToolName = 'read' | 'write' | 'edit' | 'glob' | 'grep' | 'bash' | 'webFetch' | 'webSearch';
+export type ToolName =
+  | 'read'
+  | 'write'
+  | 'edit'
+  | 'glob'
+  | 'grep'
+  | 'bash'
+  | 'webFetch'
+  | 'webSearch';
 
 export interface ToolResult {
   success: boolean;
@@ -639,6 +724,8 @@ export interface MemoryRuntimeConfig {
 }
 
 export interface AppConfig {
+  subagent?: SubagentConfig;
+  subagentConfigError?: string;
   provider: ProviderType;
   apiKey: string;
   baseUrl?: string;
@@ -650,7 +737,7 @@ export interface AppConfig {
   profiles: Partial<Record<ProviderProfileKey, ProviderProfile>>;
   activeConfigSetId: ConfigSetId;
   configSets: ApiConfigSet[];
-  claudeCodePath?: string;
+  agentCliPath?: string;
   defaultWorkdir?: string;
   globalSkillsPath?: string;
   theme?: AppTheme;
@@ -753,10 +840,7 @@ export interface LocalServiceInfo {
   models?: string[];
 }
 
-export type LocalOllamaDiscoveryStatus =
-  | 'unavailable'
-  | 'service_available'
-  | 'models_available';
+export type LocalOllamaDiscoveryStatus = 'unavailable' | 'service_available' | 'models_available';
 
 export interface LocalOllamaDiscoveryResult {
   available: boolean;
