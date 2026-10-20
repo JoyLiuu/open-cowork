@@ -2,7 +2,7 @@ import { EventEmitter } from 'events';
 import { WriteStream } from 'fs';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
-import { basename, dirname, join } from 'path';
+import { basename, dirname, join, sep } from 'path';
 import { describe, expect, it, vi } from 'vitest';
 import type { ChildProcess, SpawnOptions } from 'child_process';
 import { execFileSync, spawn } from 'child_process';
@@ -29,6 +29,14 @@ import {
 } from '../../main/agent/lima-sandbox-operations';
 
 const SANDBOX = '/home/lima/.claude/sandbox/session-1';
+
+function stubTempDirectory(directory: string): void {
+  // Windows uses TEMP/TMP; macOS and Linux use TMPDIR. Keep the failure
+  // injection independent of both the platform and the inherited environment.
+  for (const name of ['TMPDIR', 'TMP', 'TEMP']) {
+    vi.stubEnv(name, directory);
+  }
+}
 
 class FakeChildProcess extends EventEmitter {
   stdout = new EventEmitter();
@@ -506,12 +514,12 @@ describe('lima sandbox coding tools', () => {
     }
   });
 
-  it('reads overflow output when TMPDIR has a trailing separator', async () => {
+  it('reads overflow output when the temp directory has a trailing separator', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'cowork-lima-trailing-'));
     const child = new FakeChildProcess();
     const spawnProcess = createSpawnMock([child]);
     try {
-      vi.stubEnv('TMPDIR', `${directory}/`);
+      stubTempDirectory(`${directory}${sep}`);
       const [read, bash] = createLimaSandboxCodingTools(SANDBOX, { spawnProcess });
       const pending = bash.execute('trailing-output', { command: 'generate-output' });
       child.stdout.emit('data', Buffer.from('trailing-output\n'.repeat(12000)));
@@ -529,14 +537,14 @@ describe('lima sandbox coding tools', () => {
     }
   });
 
-  it('keeps output generation and reads in the original directory when TMPDIR changes', async () => {
+  it('keeps output generation and reads in the original directory when temp variables change', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'cowork-lima-directory-'));
     const child = new FakeChildProcess();
     const spawnProcess = createSpawnMock([child]);
     try {
-      vi.stubEnv('TMPDIR', directory);
+      stubTempDirectory(directory);
       const [read, bash] = createLimaSandboxCodingTools(SANDBOX, { spawnProcess });
-      vi.stubEnv('TMPDIR', join(directory, 'missing'));
+      stubTempDirectory(join(directory, 'missing'));
       const pending = bash.execute('fixed-directory', { command: 'generate-output' });
       child.stdout.emit('data', Buffer.from('fixed-directory\n'.repeat(12000)));
       child.emit('close', 0);
@@ -561,7 +569,7 @@ describe('lima sandbox coding tools', () => {
     const spawnProcess = createSpawnMock([child]);
     const end = vi.spyOn(WriteStream.prototype, 'end');
     try {
-      vi.stubEnv('TMPDIR', join(directory, 'missing'));
+      stubTempDirectory(join(directory, 'missing'));
       const [, bash] = createLimaSandboxCodingTools(SANDBOX, { spawnProcess });
       const pending = bash.execute('output-error', { command: 'generate-output' });
       child.stdout.emit('data', Buffer.alloc(65536, 'x'));
@@ -583,7 +591,7 @@ describe('lima sandbox coding tools', () => {
   it('reports output-file failures from the real host backend without crashing', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'cowork-host-write-error-'));
     try {
-      vi.stubEnv('TMPDIR', join(directory, 'missing'));
+      stubTempDirectory(join(directory, 'missing'));
       const bash = createBashTool(directory);
       await expect(
         bash.execute('host-write-error', {
@@ -602,7 +610,7 @@ describe('lima sandbox coding tools', () => {
     const child = new FakeChildProcess();
     const end = vi.spyOn(WriteStream.prototype, 'end');
     try {
-      vi.stubEnv('TMPDIR', join(directory, 'missing'));
+      stubTempDirectory(join(directory, 'missing'));
       const [, bash] = createLimaSandboxCodingTools(SANDBOX, {
         spawnProcess: createSpawnMock([child]),
       });
