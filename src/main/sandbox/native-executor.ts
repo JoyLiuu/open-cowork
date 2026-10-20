@@ -132,7 +132,18 @@ export class NativeExecutor implements SandboxExecutor {
     const workDir = cwd ? this.validatePath(cwd) : this.workspacePath;
     this.validateCommand(command, workDir);
 
-    const codePage = await getWindowsConsoleCodePage();
+    const executionTimeout = timeoutMs || this.config?.timeout || 60000;
+    const startedAt = Date.now();
+    const codePage = await getWindowsConsoleCodePage({ timeoutMs: executionTimeout });
+    const remainingTimeout = executionTimeout - (Date.now() - startedAt);
+    if (remainingTimeout <= 0) {
+      return {
+        success: false,
+        stdout: '',
+        stderr: 'Command timed out before execution',
+        exitCode: 1,
+      };
+    }
     const normalizeStdout: OutputNormalizer | null = createWindowsOutputNormalizer(codePage);
     const normalizeStderr: OutputNormalizer | null = createWindowsOutputNormalizer(codePage);
 
@@ -173,7 +184,7 @@ export class NativeExecutor implements SandboxExecutor {
           ...env,
           WORKSPACE: this.workspacePath,
         },
-        timeout: timeoutMs || this.config?.timeout || 60000,
+        timeout: remainingTimeout,
       });
 
       let stdout = '';
@@ -199,6 +210,8 @@ export class NativeExecutor implements SandboxExecutor {
 
       proc.on('close', (code: number | null) => {
         cleanupScript();
+        stdout += normalizeStdout?.flush().toString('utf-8') ?? '';
+        stderr += normalizeStderr?.flush().toString('utf-8') ?? '';
         resolve({
           success: code === 0,
           stdout,

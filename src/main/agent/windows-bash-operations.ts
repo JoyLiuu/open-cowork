@@ -149,9 +149,16 @@ export function createWindowsBashOperations(
       }
 
       const { shell, args } = buildWindowsShellInvocation(command, shellResolver(cwd));
-      const codePage = await getWindowsConsoleCodePage();
+      const startedAt = Date.now();
+      const timeoutMs = timeout !== undefined && timeout > 0 ? timeout * 1000 : undefined;
+      const codePage = await getWindowsConsoleCodePage({ timeoutMs, signal });
       if (signal?.aborted) {
         throw new Error('aborted');
+      }
+      const remainingMs =
+        timeoutMs === undefined ? undefined : timeoutMs - (Date.now() - startedAt);
+      if (remainingMs !== undefined && remainingMs <= 0) {
+        throw new Error(`timeout:${timeout}`);
       }
       const normalizeStdout: OutputNormalizer | null = createWindowsOutputNormalizer(codePage);
       const normalizeStderr: OutputNormalizer | null = createWindowsOutputNormalizer(codePage);
@@ -170,6 +177,10 @@ export function createWindowsBashOperations(
         let timeoutHandle: NodeJS.Timeout | undefined;
         let forcedSettleHandle: NodeJS.Timeout | undefined;
 
+        const emitOutput = (data: Buffer | undefined) => {
+          if (data?.length) onData(data);
+        };
+
         const cleanup = () => {
           if (timeoutHandle) clearTimeout(timeoutHandle);
           if (forcedSettleHandle) clearTimeout(forcedSettleHandle);
@@ -178,6 +189,8 @@ export function createWindowsBashOperations(
           child.off('close', onClose);
           child.off('error', onError);
           signal?.removeEventListener('abort', onAbort);
+          emitOutput(normalizeStdout?.flush());
+          emitOutput(normalizeStderr?.flush());
         };
 
         const settleResolve = (value: { exitCode: number | null }) => {
@@ -234,21 +247,21 @@ export function createWindowsBashOperations(
         }
 
         const onStdoutChunk = (chunk: Buffer) => {
-          onData(normalizeStdout ? normalizeStdout(chunk) : chunk);
+          emitOutput(normalizeStdout ? normalizeStdout(chunk) : chunk);
         };
         const onStderrChunk = (chunk: Buffer) => {
-          onData(normalizeStderr ? normalizeStderr(chunk) : chunk);
+          emitOutput(normalizeStderr ? normalizeStderr(chunk) : chunk);
         };
         child.stdout?.on('data', onStdoutChunk);
         child.stderr?.on('data', onStderrChunk);
         child.once('close', onClose);
         child.once('error', onError);
 
-        if (timeout !== undefined && timeout > 0) {
+        if (remainingMs !== undefined) {
           timeoutHandle = setTimeout(() => {
             timedOut = true;
             terminateChild('timeout');
-          }, timeout * 1000);
+          }, remainingMs);
           timeoutHandle.unref?.();
         }
 

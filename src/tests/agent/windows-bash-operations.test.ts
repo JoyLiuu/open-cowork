@@ -196,4 +196,46 @@ describe('windows bash operations', () => {
     await expect(pending).rejects.toThrow('aborted');
     expect(spawnProcess).not.toHaveBeenCalled();
   });
+
+  it('flushes both output streams on close without sending empty data events', async () => {
+    vi.mocked(getWindowsConsoleCodePage).mockResolvedValue(1252);
+    const child = new FakeChildProcess();
+    const spawnProcess = createSpawnMock([child]);
+    const onData = vi.fn<(chunk: Buffer) => void>();
+    const pending = createWindowsBashOperations({
+      spawnProcess,
+      shellResolver: () => 'cmd.exe',
+    }).exec('print-output', process.cwd(), { onData });
+    await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalled());
+
+    child.stdout.emit('data', Buffer.from([0xe9]));
+    child.stderr.emit('data', Buffer.from([0xc4]));
+    expect(onData).not.toHaveBeenCalled();
+    child.emit('close', 0);
+
+    await expect(pending).resolves.toEqual({ exitCode: 0 });
+    expect(onData.mock.calls.map(([chunk]: [Buffer]) => chunk.toString('utf-8'))).toEqual([
+      'é',
+      'Ä',
+    ]);
+  });
+
+  it('does not start a command after detection consumes its timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(getWindowsConsoleCodePage).mockImplementationOnce(async () => {
+        vi.setSystemTime(Date.now() + 1000);
+        return 936;
+      });
+      const spawnProcess = createSpawnMock([]);
+      const pending = createWindowsBashOperations({
+        spawnProcess,
+        shellResolver: () => 'cmd.exe',
+      }).exec('echo should-not-run', process.cwd(), { onData: vi.fn(), timeout: 1 });
+      await expect(pending).rejects.toThrow('timeout:1');
+      expect(spawnProcess).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

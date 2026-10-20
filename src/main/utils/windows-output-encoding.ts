@@ -30,19 +30,27 @@ const CODEPAGE_TO_DECODER_LABEL: Record<number, string> = {
 
 let cachedCodePage: number | null | undefined;
 
-async function readOemCodePageFromRegistry(): Promise<number | null> {
+async function readOemCodePageFromRegistry(
+  timeoutMs: number,
+  signal?: AbortSignal
+): Promise<number | null> {
   const { stdout } = await execFileAsync('reg', ['query', OEM_CODE_PAGE_KEY, '/v', 'OEMCP'], {
-    timeout: 5000,
+    timeout: timeoutMs,
     windowsHide: true,
+    signal,
   });
   const match = /OEMCP\s+REG_SZ\s+(\d+)/i.exec(stdout);
   return match ? Number(match[1]) : null;
 }
 
-async function readCodePageFromChcp(): Promise<number | null> {
+async function readCodePageFromChcp(
+  timeoutMs: number,
+  signal?: AbortSignal
+): Promise<number | null> {
   const { stdout } = await execFileAsync('cmd.exe', ['/d', '/c', 'chcp'], {
-    timeout: 5000,
+    timeout: timeoutMs,
     windowsHide: true,
+    signal,
   });
   const match = /(\d+)/.exec(stdout);
   return match ? Number(match[1]) : null;
@@ -55,7 +63,9 @@ async function readCodePageFromChcp(): Promise<number | null> {
  * `reg query` reads the system OEM codepage directly from the registry and
  * does not require an attached console, unlike `chcp`.
  */
-export async function getWindowsConsoleCodePage(): Promise<number | null> {
+export async function getWindowsConsoleCodePage(
+  options: { timeoutMs?: number; signal?: AbortSignal } = {}
+): Promise<number | null> {
   if (cachedCodePage !== undefined) {
     return cachedCodePage;
   }
@@ -65,20 +75,25 @@ export async function getWindowsConsoleCodePage(): Promise<number | null> {
   }
 
   let codePage: number | null = null;
+  const deadline = Date.now() + (options.timeoutMs ?? 10000);
+  const remaining = () => Math.max(0, Math.min(5000, deadline - Date.now()));
+  const registryTimeout = remaining();
+  if (options.signal?.aborted || registryTimeout === 0) return null;
   try {
-    codePage = await readOemCodePageFromRegistry();
+    codePage = await readOemCodePageFromRegistry(registryTimeout, options.signal);
   } catch {
     // Registry read failed; fall back to chcp below.
   }
-  if (codePage === null) {
+  const fallbackTimeout = remaining();
+  if (codePage === null && !options.signal?.aborted && fallbackTimeout > 0) {
     try {
-      codePage = await readCodePageFromChcp();
+      codePage = await readCodePageFromChcp(fallbackTimeout, options.signal);
     } catch {
       // Unable to determine the codepage; skip normalization.
     }
   }
 
-  cachedCodePage = codePage;
+  if (codePage !== null) cachedCodePage = codePage;
   return codePage;
 }
 
@@ -87,24 +102,10 @@ export async function getWindowsConsoleCodePage(): Promise<number | null> {
  * It is streaming-safe: multi-byte characters split across chunks are
  * accumulated by the underlying TextDecoder.
  */
-export type OutputNormalizer = (chunk: Buffer) => Buffer;
-
-/**
- * A normalizer adaptively converts a non-UTF-8 codepage byte stream into
- * UTF-8 by inspecting the bytes themselves instead of naming the producing
- * shell.
- *
- * The returned closure is stateful (it buffers undecided tail bytes and
- * remembers once it has switched to the OEM codepage), so it must be bound to
- * a single logical byte stream. Callers that capture two streams — e.g.
- * stdout and stderr — must create one instance per stream from the same
- * code-page read.
- *
- * A trailing incomplete multi-byte sequence at the end of stream is
- * intentionally not flushed: its encoding cannot be determined, and it only
- * occurs when output is cut mid-character, in which case the surrounding
- * output is corrupt anyway.
- */
+export interface OutputNormalizer {
+  (chunk: Buffer): Buffer;
+  flush(): Buffer;
+}
 
 interface Utf8Classification {
   /** Index of the first byte of an invalid UTF-8 sequence, or -1. */
@@ -118,10 +119,9 @@ function hasContinuationByte(b: number): boolean {
 }
 
 /**
- * Classify a byte buffer against strict UTF-8 rules. A strict classifier is
- * required because a lenient one would accept GBK/Shift-JIS bytes as UTF-8
- * (the original source of the mojibake) and because truncated lead bytes must
- * not be mistaken for invalid data.
+ * Classify strict UTF-8 without confusing an incomplete sequence with an
+ * invalid one. Bytes valid in both UTF-8 and an OEM encoding remain ambiguous;
+ * the normalizer deliberately preserves valid UTF-8 in that case.
  */
 function classifyUtf8(buf: Buffer): Utf8Classification {
   const n = buf.length;
@@ -207,6 +207,9 @@ function classifyUtf8(buf: Buffer): Utf8Classification {
  * when invalid UTF-8 bytes appear does it switch to decoding the rest from the
  * OEM codepage. This adapts to arbitrary shells/consumers without an
  * enumeration of shell names.
+ *
+ * Each stream needs its own instance. Call flush at the end: an undecided
+ * tail can be a complete OEM character, even if it resembles a UTF-8 lead.
  */
 export function createWindowsOutputNormalizer(codePage: number | null): OutputNormalizer | null {
   if (codePage === null || codePage === 65001) {
@@ -228,7 +231,7 @@ export function createWindowsOutputNormalizer(codePage: number | null): OutputNo
   let pending: Buffer = Buffer.alloc(0);
   let inOemMode = false;
 
-  return (chunk: Buffer): Buffer => {
+  const normalize = (chunk: Buffer): Buffer => {
     if (inOemMode) {
       return Buffer.from(oemDecoder.decode(chunk, { stream: true }), 'utf-8');
     }
@@ -259,4 +262,14 @@ export function createWindowsOutputNormalizer(codePage: number | null): OutputNo
     pending = Buffer.alloc(0);
     return combined;
   };
+
+  return Object.assign(normalize, {
+    flush: (): Buffer => {
+      const tail = pending;
+      pending = Buffer.alloc(0);
+      // decode without stream:true also flushes any bytes buffered by the
+      // OEM decoder. A second flush returns no data.
+      return Buffer.from(oemDecoder.decode(tail), 'utf-8');
+    },
+  });
 }

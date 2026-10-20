@@ -2,14 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   createWindowsOutputNormalizer,
   getWindowsConsoleCodePage,
+  type OutputNormalizer,
 } from '../../main/utils/windows-output-encoding';
 
-function decodeAll(normalize: (chunk: Buffer) => Buffer, chunks: number[][]): string {
-  return chunks
-    .map((bytes) => Buffer.from(bytes))
-    .map(normalize)
-    .map((buffer) => buffer.toString('utf-8'))
-    .join('');
+function decodeAll(normalize: OutputNormalizer, chunks: number[][]): string {
+  const output = chunks.map((bytes) => normalize(Buffer.from(bytes)));
+  output.push(normalize.flush());
+  return Buffer.concat(output).toString('utf-8');
 }
 
 describe('createWindowsOutputNormalizer', () => {
@@ -104,6 +103,23 @@ describe('createWindowsOutputNormalizer', () => {
     expect(createWindowsOutputNormalizer(65001)).toBeNull();
     expect(createWindowsOutputNormalizer(null)).toBeNull();
     expect(createWindowsOutputNormalizer(999)).toBeNull();
+  });
+
+  it.each([
+    [1251, [0x6f, 0x6b, 0x20, 0xc4], 'ok Д'],
+    [1252, [0x63, 0x61, 0x66, 0xe9], 'café'],
+  ] as const)(
+    'flushes a complete trailing character from code page %i',
+    (codePage, bytes, text) => {
+      const normalize = createWindowsOutputNormalizer(codePage)!;
+      const prefix = normalize(Buffer.from(bytes));
+      expect(Buffer.concat([prefix, normalize.flush()]).toString('utf-8')).toBe(text);
+      expect(normalize.flush()).toHaveLength(0);
+    }
+  );
+
+  it('flushes the OEM decoder when the stream ends mid-character', () => {
+    expect(decodeAll(createWindowsOutputNormalizer(936)!, [[0xc4, 0xe3, 0xc4]])).toBe('你�');
   });
 });
 
