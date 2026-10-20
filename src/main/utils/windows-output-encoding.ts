@@ -31,11 +31,10 @@ const CODEPAGE_TO_DECODER_LABEL: Record<number, string> = {
 let cachedCodePage: number | null | undefined;
 
 async function readOemCodePageFromRegistry(): Promise<number | null> {
-  const { stdout } = await execFileAsync(
-    'reg',
-    ['query', OEM_CODE_PAGE_KEY, '/v', 'OEMCP'],
-    { timeout: 5000, windowsHide: true }
-  );
+  const { stdout } = await execFileAsync('reg', ['query', OEM_CODE_PAGE_KEY, '/v', 'OEMCP'], {
+    timeout: 5000,
+    windowsHide: true,
+  });
   const match = /OEMCP\s+REG_SZ\s+(\d+)/i.exec(stdout);
   return match ? Number(match[1]) : null;
 }
@@ -154,22 +153,22 @@ function classifyUtf8(buf: Buffer): Utf8Classification {
       // Validate whatever continuation bytes are present.
       for (let j = 1; j < available; j++) {
         if (!hasContinuationByte(buf[i + j])) {
-          return { invalidAt: i + j, incompleteAt: -1 };
+          return { invalidAt: i, incompleteAt: -1 };
         }
       }
       if (available >= 2) {
         const second = buf[i + 1];
         if (b === 0xe0 && second < 0xa0) {
-          return { invalidAt: i + 1, incompleteAt: -1 };
+          return { invalidAt: i, incompleteAt: -1 };
         }
         if (b === 0xed && second > 0x9f) {
-          return { invalidAt: i + 1, incompleteAt: -1 };
+          return { invalidAt: i, incompleteAt: -1 };
         }
         if (b === 0xf0 && second < 0x90) {
-          return { invalidAt: i + 1, incompleteAt: -1 };
+          return { invalidAt: i, incompleteAt: -1 };
         }
         if (b === 0xf4 && second > 0x8f) {
-          return { invalidAt: i + 1, incompleteAt: -1 };
+          return { invalidAt: i, incompleteAt: -1 };
         }
       }
       return { invalidAt: -1, incompleteAt: i };
@@ -177,20 +176,20 @@ function classifyUtf8(buf: Buffer): Utf8Classification {
 
     for (let j = 1; j < len; j++) {
       if (!hasContinuationByte(buf[i + j])) {
-        return { invalidAt: i + j, incompleteAt: -1 };
+        return { invalidAt: i, incompleteAt: -1 };
       }
     }
     if (b === 0xe0 && buf[i + 1] < 0xa0) {
-      return { invalidAt: i + 1, incompleteAt: -1 };
+      return { invalidAt: i, incompleteAt: -1 };
     }
     if (b === 0xed && buf[i + 1] > 0x9f) {
-      return { invalidAt: i + 1, incompleteAt: -1 };
+      return { invalidAt: i, incompleteAt: -1 };
     }
     if (b === 0xf0 && buf[i + 1] < 0x90) {
-      return { invalidAt: i + 1, incompleteAt: -1 };
+      return { invalidAt: i, incompleteAt: -1 };
     }
     if (b === 0xf4 && buf[i + 1] > 0x8f) {
-      return { invalidAt: i + 1, incompleteAt: -1 };
+      return { invalidAt: i, incompleteAt: -1 };
     }
 
     i += len;
@@ -238,15 +237,12 @@ export function createWindowsOutputNormalizer(codePage: number | null): OutputNo
     const scan = classifyUtf8(combined);
 
     if (scan.invalidAt !== -1) {
-      // Invalid UTF-8 seen: the stream is not UTF-8. Everything up to the
-      // invalid byte is flushed through the OEM decoder (re-buffered bytes),
-      // then the rest, after which all further output is OEM-decoded.
+      // Keep complete UTF-8 sequences already confirmed by the scan. Decode
+      // from the start of the broken sequence as OEM, including its lead byte.
       inOemMode = true;
       const prefix = combined.subarray(0, scan.invalidAt);
       const tail = combined.subarray(scan.invalidAt);
-      const text =
-        oemDecoder.decode(prefix, { stream: true }) +
-        oemDecoder.decode(tail, { stream: true });
+      const text = prefix.toString('utf-8') + oemDecoder.decode(tail, { stream: true });
       pending = Buffer.alloc(0);
       return Buffer.from(text, 'utf-8');
     }

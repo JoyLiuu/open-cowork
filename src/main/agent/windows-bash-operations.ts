@@ -141,9 +141,7 @@ export function createWindowsBashOperations(
   return {
     exec: async (command, cwd, { onData, signal, timeout, env }) => {
       if (!existsSync(cwd)) {
-        throw new Error(
-          `Working directory does not exist: ${cwd}\nCannot execute bash commands.`
-        );
+        throw new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`);
       }
 
       if (signal?.aborted) {
@@ -152,6 +150,9 @@ export function createWindowsBashOperations(
 
       const { shell, args } = buildWindowsShellInvocation(command, shellResolver(cwd));
       const codePage = await getWindowsConsoleCodePage();
+      if (signal?.aborted) {
+        throw new Error('aborted');
+      }
       const normalizeStdout: OutputNormalizer | null = createWindowsOutputNormalizer(codePage);
       const normalizeStderr: OutputNormalizer | null = createWindowsOutputNormalizer(codePage);
 

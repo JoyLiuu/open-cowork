@@ -23,7 +23,12 @@ describe('createWindowsOutputNormalizer', () => {
   it('handles multi-byte characters split across chunk boundaries', () => {
     const normalize = createWindowsOutputNormalizer(936)!;
     expect(decodeAll(normalize, [[0xc4], [0xe3, 0xba], [0xc3]])).toBe('你好');
-    expect(decodeAll(normalize, [[0xc4, 0xe3], [0xba, 0xc3]])).toBe('你好');
+    expect(
+      decodeAll(normalize, [
+        [0xc4, 0xe3],
+        [0xba, 0xc3],
+      ])
+    ).toBe('你好');
     expect(decodeAll(normalize, [[0xc4], [0xe3], [0xba], [0xc3]])).toBe('你好');
   });
 
@@ -42,22 +47,40 @@ describe('createWindowsOutputNormalizer', () => {
     const normalize = createWindowsOutputNormalizer(936)!;
     const input = Buffer.from('echo hello', 'ascii');
     expect(normalize(input).equals(input)).toBe(true);
-    expect(decodeAll(normalize, [[0x65, 0x63, 0x68, 0x6f], [0x20, 0x68, 0x65, 0x6c, 0x6c, 0x6f]])).toBe(
-      'echo hello'
-    );
+    expect(
+      decodeAll(normalize, [
+        [0x65, 0x63, 0x68, 0x6f],
+        [0x20, 0x68, 0x65, 0x6c, 0x6c, 0x6f],
+      ])
+    ).toBe('echo hello');
   });
 
   it('passes valid UTF-8 through untouched, including across chunks', () => {
     const normalize = createWindowsOutputNormalizer(936)!;
     const utf8 = Buffer.from('你好', 'utf-8');
     expect(normalize(utf8).equals(utf8)).toBe(true);
-    expect(decodeAll(normalize, [[0xe4, 0xbd], [0xa0, 0xe5], [0xa5, 0xbd]])).toBe('你好');
+    expect(
+      decodeAll(normalize, [
+        [0xe4, 0xbd],
+        [0xa0, 0xe5],
+        [0xa5, 0xbd],
+      ])
+    ).toBe('你好');
   });
 
   it('keeps a confirmed UTF-8 prefix and converts only the trailing OEM bytes', () => {
-    const normalize = createWindowsOutputNormalizer(936)!;
     // '好' as UTF-8, then GBK bytes for 你
-    expect(decodeAll(normalize, [[0xe5, 0xa5, 0xbd], [0xc4, 0xe3]])).toBe('好你');
+    const bytes = [0xe5, 0xa5, 0xbd, 0xc4, 0xe3];
+    // Every partition must keep the same confirmed UTF-8 prefix, including
+    // a single chunk and a split inside either multibyte character.
+    for (let mask = 0; mask < 1 << (bytes.length - 1); mask++) {
+      const chunks: number[][] = [[]];
+      bytes.forEach((byte, index) => {
+        chunks[chunks.length - 1].push(byte);
+        if (mask & (1 << index)) chunks.push([]);
+      });
+      expect(decodeAll(createWindowsOutputNormalizer(936)!, chunks)).toBe('好你');
+    }
   });
 
   it('switches to the OEM codepage once invalid UTF-8 appears', () => {

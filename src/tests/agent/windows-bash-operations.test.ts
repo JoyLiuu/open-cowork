@@ -1,12 +1,22 @@
 import { EventEmitter } from 'events';
 import os from 'os';
 import path from 'path';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChildProcess, SpawnOptions } from 'child_process';
 import {
   buildWindowsShellInvocation,
   createWindowsBashOperations,
 } from '../../main/agent/windows-bash-operations';
+import { getWindowsConsoleCodePage } from '../../main/utils/windows-output-encoding';
+
+vi.mock('../../main/utils/windows-output-encoding', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../main/utils/windows-output-encoding')>();
+  return { ...actual, getWindowsConsoleCodePage: vi.fn() };
+});
+
+beforeEach(() => {
+  vi.mocked(getWindowsConsoleCodePage).mockResolvedValue(936);
+});
 
 class FakeChildProcess extends EventEmitter {
   stdout = new EventEmitter();
@@ -74,19 +84,15 @@ describe('windows bash operations', () => {
       onData,
       env: { PATH: 'test-path' },
     });
-    // Wait until the async exec body has actually reached its spawn point
-    // (on Windows it first reads the console code page via a subprocess).
+    // Wait for the asynchronous code-page lookup before emitting output.
     await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalled());
-    // GBK bytes (你好). On non-Windows hosts they pass through untouched; on
-    // Windows they are re-encoded to UTF-8 by the codepage normalizer.
+    // The code page is explicit; the test does not depend on the host locale.
     const output = Buffer.from([0xc4, 0xe3, 0xba, 0xc3]);
     child.stdout.emit('data', output);
     child.emit('close', 0);
 
     await expect(promise).resolves.toEqual({ exitCode: 0 });
-    const expectedBuffer =
-      process.platform === 'win32' ? Buffer.from('你好', 'utf-8') : output;
-    expect(onData).toHaveBeenCalledWith(expectedBuffer);
+    expect(onData).toHaveBeenCalledWith(Buffer.from('你好', 'utf-8'));
     expect(spawnProcess).toHaveBeenCalledWith(
       'C:\\Windows\\System32\\cmd.exe',
       ['/d', '/s', '/c', 'echo hello'],
@@ -157,6 +163,37 @@ describe('windows bash operations', () => {
         onData: vi.fn(),
       })
     ).rejects.toThrow('Working directory does not exist');
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
+  it('does not spawn when cancelled while the code page is being detected', async () => {
+    let finishDetection!: (value: number) => void;
+    vi.mocked(getWindowsConsoleCodePage).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishDetection = resolve;
+      })
+    );
+    const child = new FakeChildProcess();
+    const spawnProcess = createSpawnMock([child]);
+    // Let the old implementation settle too, so the regression fails on the
+    // forbidden spawn rather than hanging until the test timeout.
+    spawnProcess.mockImplementation(() => {
+      setImmediate(() => child.emit('close', 0));
+      return child as unknown as ChildProcess;
+    });
+    const controller = new AbortController();
+    const pending = createWindowsBashOperations({
+      spawnProcess,
+      shellResolver: () => 'cmd.exe',
+    }).exec('echo should-not-run', process.cwd(), {
+      onData: vi.fn(),
+      signal: controller.signal,
+    });
+
+    controller.abort();
+    finishDetection(936);
+
+    await expect(pending).rejects.toThrow('aborted');
     expect(spawnProcess).not.toHaveBeenCalled();
   });
 });
