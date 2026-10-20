@@ -19,19 +19,19 @@ export function shouldGenerateTitle(input: TitleDecisionInput): boolean {
 // chain-of-thought into the content, so read the text after the last marker and
 // ignore whatever precedes it; fall back to the first non-empty line when the
 // marker is absent.
-const TITLE_MARKER_RE = /TITLE::?[ \t]*([^\r\n]*)/gi;
+const TITLE_MARKER_RE = /^[ \t]*TITLE::[ \t]*([^\r\n]*)/gm;
 
 export function normalizeGeneratedTitle(value: string | null | undefined): string | null {
   if (!value) return null;
 
-  const marked = [...value.matchAll(TITLE_MARKER_RE)].pop()?.[1]?.trim();
+  const marked = [...value.matchAll(TITLE_MARKER_RE)].pop();
   const candidate =
-    marked ||
-    value
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find(Boolean) ||
-    '';
+    (marked
+      ? marked[1]
+      : value
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .find(Boolean)) ?? '';
 
   const normalized = candidate.replace(/^["'`]+|["'`]+$/g, '').trim();
   if (!normalized) return null;

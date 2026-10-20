@@ -37,7 +37,7 @@ afterEach(() => {
 });
 
 describe('database startup reconciliation', () => {
-  it("resets orphaned 'running' sessions to 'idle' when reopening the database", () => {
+  it('leaves recovery to the startup owner instead of resetting on database open', () => {
     const first = initDatabase();
     first.sessions.create(makeSession('interrupted', 'running'));
     first.sessions.create(makeSession('idle-session', 'idle'));
@@ -45,9 +45,26 @@ describe('database startup reconciliation', () => {
     closeDatabase();
 
     const reopened = initDatabase();
+    expect(reopened.sessions.get('interrupted')?.status).toBe('running');
+    expect(reopened.sessions.markRunningIdle()).toBe(1);
     expect(reopened.sessions.get('interrupted')?.status).toBe('idle');
     expect(reopened.sessions.get('idle-session')?.status).toBe('idle');
     expect(reopened.sessions.get('completed-session')?.status).toBe('completed');
+  });
+
+  it('does not reset a live session when another instance opens the same database', async () => {
+    const owner = initDatabase();
+    owner.sessions.create(makeSession('active-in-owner', 'running'));
+    // A fresh module models another process, with its own database singleton.
+    vi.resetModules();
+    const otherInstance = await import('../src/main/db/database');
+    try {
+      const other = otherInstance.initDatabase();
+      expect(other.sessions.get('active-in-owner')?.status).toBe('running');
+      expect(owner.sessions.get('active-in-owner')?.status).toBe('running');
+    } finally {
+      otherInstance.closeDatabase();
+    }
   });
 });
 

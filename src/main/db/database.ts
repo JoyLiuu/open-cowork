@@ -448,10 +448,6 @@ export function initDatabase(): DatabaseInstance {
   // Initialize schema
   initializeSchema(rawDb);
 
-  // No run survives a restart, so a persisted 'running' is always a leftover
-  // from a killed process. Clear it once at startup to avoid a stuck indicator.
-  rawDb.prepare("UPDATE sessions SET status = 'idle' WHERE status = 'running'").run();
-
   // Prepare statements for better performance
   const insertSession = rawDb.prepare(`
     INSERT OR REPLACE INTO sessions
