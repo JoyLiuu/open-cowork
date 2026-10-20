@@ -1332,6 +1332,18 @@ app
 
     // Initialize database
     const db = initDatabase();
+    // A run does not outlive its process, so a session still marked running was left by an earlier
+    // launch, but only when no other process can be running it. A dev run takes no single-instance
+    // lock, and a second instance that lost the lock is on its way out but still reaches this point.
+    if (!isDev && hasSingleInstanceLock) {
+      const interruptedSessions = db.sessions.markRunningIdle();
+      if (interruptedSessions > 0) {
+        log(
+          '[App] Marked sessions left running by the previous launch as idle:',
+          interruptedSessions
+        );
+      }
+    }
 
     pluginRuntimeService = new PluginRuntimeService(new PluginCatalogService());
     memoryService = new MemoryService(db);
@@ -2136,11 +2148,15 @@ ipcMain.handle('config.getPublicPath', () => {
 
 // MCP Server IPC handlers
 ipcMain.handle('mcp.getServers', () => {
+  return mcpConfigStore.getServers();
+});
+
+ipcMain.handle('mcp.getServersForSettings', () => {
   try {
-    return mcpConfigStore.getServers();
+    return mcpConfigStore.getServersForSettings();
   } catch (error) {
     logError('[MCP] Error getting servers:', error);
-    return [];
+    throw error;
   }
 });
 
@@ -3120,6 +3136,13 @@ ipcMain.handle('memory.forgetCoreEntry', (_event, combinedKey: string) => {
     throw new Error('Memory service not initialized');
   }
   return memoryService.forgetCoreEntry(combinedKey);
+});
+
+ipcMain.handle('memory.forgetSession', (_event, sessionId: string) => {
+  if (!memoryService) {
+    throw new Error('Memory service not initialized');
+  }
+  return memoryService.forgetSession(sessionId);
 });
 
 ipcMain.handle('memory.rebuildAll', async () => {
