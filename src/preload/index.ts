@@ -475,6 +475,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('memory.writeCoreEntry', combinedKey, value),
     forgetCoreEntry: (combinedKey: string): Promise<CoreMemoryListEntry[]> =>
       ipcRenderer.invoke('memory.forgetCoreEntry', combinedKey),
+    forgetSession: (sessionId: string): Promise<void> =>
+      ipcRenderer.invoke('memory.forgetSession', sessionId),
     rebuildAll: (): Promise<{ success: boolean; workspaceCount: number; sessionCount: number }> =>
       ipcRenderer.invoke('memory.rebuildAll'),
     listFiles: (): Promise<MemoryDebugFileInfo[]> => ipcRenderer.invoke('memory.listFiles'),
@@ -735,6 +737,7 @@ declare global {
         getCoreEntries: () => Promise<CoreMemoryListEntry[]>;
         writeCoreEntry: (combinedKey: string, value: string) => Promise<CoreMemoryListEntry[]>;
         forgetCoreEntry: (combinedKey: string) => Promise<CoreMemoryListEntry[]>;
+        forgetSession: (sessionId: string) => Promise<void>;
         rebuildAll: () => Promise<{
           success: boolean;
           workspaceCount: number;

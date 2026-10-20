@@ -20,6 +20,12 @@ export interface DatabaseInstance {
     get: (id: string) => SessionRow | undefined;
     getAll: () => SessionRow[];
     delete: (id: string) => void;
+    /**
+     * Sets every session still marked `running` to `idle` and returns how many there were.
+     * Meant for startup: a run does not outlive its process, so a `running` row left by the
+     * previous launch belongs to a run that is gone. `updated_at` is kept so the list order holds.
+     */
+    markRunningIdle: () => number;
   };
 
   // Message operations
@@ -466,6 +472,10 @@ export function initDatabase(): DatabaseInstance {
     SELECT * FROM sessions ORDER BY updated_at DESC
   `);
 
+  const markRunningIdleStmt = rawDb.prepare(`
+    UPDATE sessions SET status = 'idle' WHERE status = 'running'
+  `);
+
   const deleteSessionStmt = rawDb.prepare(`
     DELETE FROM sessions WHERE id = ?
   `);
@@ -589,6 +599,8 @@ export function initDatabase(): DatabaseInstance {
         // Messages will be deleted automatically due to ON DELETE CASCADE
         deleteSessionStmt.run(id);
       },
+
+      markRunningIdle: (): number => markRunningIdleStmt.run().changes,
     },
 
     messages: {
