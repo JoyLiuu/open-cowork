@@ -227,6 +227,22 @@ describe('lima sandbox bash', () => {
     expect(script).not.toContain('ls /workspace');
   });
 
+  it('keeps the guest failure when stdin closes early and the output is streamed', async () => {
+    const child = new FakeChildProcess();
+    const ops = createLimaSandboxBashOperations(SANDBOX, {
+      spawnProcess: createSpawnMock([child]),
+    });
+    const onData = vi.fn();
+
+    const pending = ops.exec('false', SANDBOX, { onData });
+    child.stdin.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+    child.stderr.emit('data', Buffer.from('bash: boom'));
+    child.emit('close', 1);
+
+    await expect(pending).resolves.toEqual({ exitCode: 1 });
+    expect(onData).toHaveBeenCalledWith(Buffer.from('bash: boom'));
+  });
+
   it('streams bash output without retaining a second copy', async () => {
     const child = new FakeChildProcess();
     const spawnProcess = createSpawnMock([child]);

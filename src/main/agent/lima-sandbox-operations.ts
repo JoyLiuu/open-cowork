@@ -218,6 +218,7 @@ function runGuestScript(
 
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
+    let stderrBytes = 0;
     let settled = false;
     let timedOut = false;
     let aborted = false;
@@ -257,7 +258,10 @@ function runGuestScript(
     };
 
     child.stdout?.on('data', (data: Buffer | string) => takeChunk(stdoutChunks, data));
-    child.stderr?.on('data', (data: Buffer | string) => takeChunk(stderrChunks, data));
+    child.stderr?.on('data', (data: Buffer | string) => {
+      stderrBytes += Buffer.byteLength(data);
+      takeChunk(stderrChunks, data);
+    });
     child.stdin?.on('error', (error: NodeJS.ErrnoException) => {
       if (error.code === 'EPIPE') {
         stdinError = error;
@@ -276,7 +280,7 @@ function runGuestScript(
         finishReject(new Error(`timeout:${options.timeoutSeconds}`));
         return;
       }
-      if (stdinError && (code === 0 || stderrChunks.length === 0)) {
+      if (stdinError && (code === 0 || stderrBytes === 0)) {
         finishReject(stdinError);
         return;
       }
