@@ -19,7 +19,14 @@ export const VIRTUAL_WORKSPACE_PATH = '/workspace';
 
 export const LIMA_SANDBOX_INSTANCE = 'claude-sandbox';
 
-const VIRTUAL_WORKSPACE_PATTERN = /(^|[\s'"`=;|&()<>])\/workspace(?=\/|$|[\s'"`;|&()<>])/g;
+// The start of a `NAME=` assignment and the entries of its `a:b:` path list before this one, so a
+// `:` separates path entries there and stays part of a file name everywhere else.
+const PATH_LIST_BEFORE = String.raw`\b[A-Za-z_][A-Za-z0-9_]*=["']?(?:[^\s'"\x60;|&()<>:]*:)*`;
+const VIRTUAL_WORKSPACE_PATTERN = new RegExp(
+  String.raw`(^|[\s'"\x60=;|&()<>]|(?<=${PATH_LIST_BEFORE}))\/workspace` +
+    String.raw`(?=\/|$|[\s'"\x60;|&()<>]|(?<=${PATH_LIST_BEFORE}\/workspace)(?=:))`,
+  'g'
+);
 const GUEST_FILE_MISSING_EXIT_CODE = 44;
 const GUEST_FILE_PERMISSION_EXIT_CODE = 45;
 const GUEST_FILE_IS_DIRECTORY_EXIT_CODE = 46;

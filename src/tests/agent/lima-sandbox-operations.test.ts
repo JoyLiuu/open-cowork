@@ -107,6 +107,28 @@ describe('lima sandbox paths', () => {
     );
   });
 
+  it.each([SANDBOX, '/tmp/guest space'])(
+    'rewrites every workspace entry of a path list assignment for sandbox root %s',
+    (root) => {
+      const mapped = root === SANDBOX ? root : `'${root}'`;
+      expect(
+        rewriteVirtualWorkspaceCommand('PATH=/workspace/bin:/workspace/sbin:$PATH', root)
+      ).toBe(`PATH=${mapped}/bin:${mapped}/sbin:$PATH`);
+      expect(rewriteVirtualWorkspaceCommand('export LD_LIBRARY_PATH=/a:/workspace/lib', root)).toBe(
+        `export LD_LIBRARY_PATH=/a:${mapped}/lib`
+      );
+      expect(rewriteVirtualWorkspaceCommand('PYTHONPATH=/workspace:/other python x.py', root)).toBe(
+        `PYTHONPATH=${mapped}:/other python x.py`
+      );
+    }
+  );
+
+  it('keeps a colon next to a workspace path outside an assignment', () => {
+    const command =
+      'scp host:/workspace/a.txt . && docker run -v "$PWD:/workspace" img && cat /workspace:backup';
+    expect(rewriteVirtualWorkspaceCommand(command, SANDBOX)).toBe(command);
+  });
+
   it('escapes single quotes in the guest working directory', () => {
     const script = buildLimaGuestShellScript(`/tmp/a'b`, 'pwd', `/tmp/a'b`);
     expect(script).toContain(`mkdir -p -- '${shellEscapePath(`/tmp/a'b`)}'`);
