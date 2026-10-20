@@ -590,9 +590,22 @@ describe('lima sandbox coding tools', () => {
 
   it('reports output-file failures from the real host backend without crashing', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'cowork-host-write-error-'));
+    const host = createLocalBashOperations();
+    let hostClosed: Promise<unknown> = Promise.resolve();
     try {
       stubTempDirectory(join(directory, 'missing'));
-      const bash = createBashTool(directory);
+      const bash = createBashTool(directory, {
+        operations: {
+          exec: (...args) => {
+            const pending = host.exec(...args);
+            hostClosed = pending.then(
+              () => undefined,
+              () => undefined
+            );
+            return pending;
+          },
+        },
+      });
       await expect(
         bash.execute('host-write-error', {
           command: `${JSON.stringify(process.execPath)} -e 'process.stdout.write("x".repeat(65536))'`,
@@ -600,6 +613,9 @@ describe('lima sandbox coding tools', () => {
       ).rejects.toMatchObject({ code: 'ENOENT' });
       await new Promise<void>((resolve) => setImmediate(resolve));
     } finally {
+      // The output-file error rejects the tool before its cancelled host
+      // backend closes. Windows keeps the cwd locked until that close.
+      await hostClosed;
       vi.unstubAllEnvs();
       await rm(directory, { recursive: true });
     }
