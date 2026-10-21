@@ -12,6 +12,7 @@ import {
 } from '../store/selectors';
 import { useAppStore } from '../store';
 import { useIPC } from '../hooks/useIPC';
+import { useSessionInputDraft } from '../hooks/useSessionInputDraft';
 import { MessageCard } from './MessageCard';
 import {
   SubagentCards,
@@ -53,7 +54,7 @@ export function ChatView() {
   // message stream at the point where each child was spawned.
   const subagents = useSubagentStates(activeSessionId);
   useLoadSubagentHistory(activeSessionId);
-  const [prompt, setPrompt] = useState('');
+  const [prompt, setPrompt] = useSessionInputDraft(activeSessionId);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [activeConnectors, setActiveConnectors] = useState<
     { id: string; name: string; connected: boolean; toolCount: number }[]
@@ -832,7 +833,7 @@ export function ChatView() {
           >
             {/* Image previews */}
             {pastedImages.length > 0 && (
-              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2 mb-3">
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2 mb-3 max-h-[28vh] overflow-y-auto p-1 [scrollbar-gutter:stable]">
                 {pastedImages.map((img, index) => (
                   <div key={img.url || `pasted-image-${index}`} className="relative group">
                     <img
@@ -854,7 +855,7 @@ export function ChatView() {
 
             {/* File attachments */}
             {attachedFiles.length > 0 && (
-              <div className="space-y-2 mb-3">
+              <div className="space-y-2 mb-3 max-h-[22vh] overflow-y-auto p-1 [scrollbar-gutter:stable]">
                 {attachedFiles.map((file, index) => (
                   <div
                     key={file.path || `attached-file-${index}`}

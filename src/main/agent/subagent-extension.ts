@@ -4,6 +4,7 @@ import {
   SessionManager as PiSessionManager,
   SettingsManager as PiSettingsManager,
   createCodingTools,
+  createReadOnlyTools,
   DefaultResourceLoader,
   type ToolDefinition,
 } from '@mariozechner/pi-coding-agent';
@@ -17,19 +18,22 @@ import { getSharedAuthStorage, ModelRegistry } from './shared-auth';
 import { MCPManager } from '../mcp/mcp-manager';
 import { configStore } from '../config/config-store';
 import { log, logError } from '../utils/logger';
+import { wrapReadToolForImageResizeErrors } from './image-resize-packaging';
 import {
   resolvePiRegistryModel,
   resolvePiRouteProtocol,
+  resolvePiModelString,
   buildSyntheticPiModelFromRuntimeConfig,
+  applyPiModelRuntimeOverrides,
 } from './pi-model-resolution';
-import { normalizeOpenAICompatibleBaseUrl } from '../config/auth-utils';
+import { isOfficialOpenAIBaseUrl, normalizeOpenAICompatibleBaseUrl } from '../config/auth-utils';
+import { normalizeSubagentConfig } from '../../shared/subagent-config';
 import type { ServerEvent } from '../../renderer/types';
 import { v4 as uuidv4 } from 'uuid';
 
 const MAX_TIMEOUT_MS = 300_000;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const TIMEOUT_MESSAGE = 'Subagent timed out';
-const MAX_CONCURRENT_SUBAGENTS = 3;
 const MAX_TASK_LENGTH = 10_000;
 
 class SubagentTimeoutError extends Error {
@@ -46,12 +50,14 @@ class ParentCancelledError extends Error {
 
 interface SubagentParams {
   task: string;
+  model?: string;
+  agent?: string;
   result_format?: string;
   allowed_tools?: string[];
   timeout_seconds?: number;
 }
 
-function buildChildSystemPrompt(task: string, resultFormat?: string): string {
+function buildChildSystemPrompt(task: string, resultFormat?: string, rolePrompt?: string): string {
   const parts = [
     'You are a focused sub-agent. Complete the task below and return ONLY the result.',
     'Do not ask questions. Do not provide commentary beyond what is needed for the result.',
@@ -59,6 +65,7 @@ function buildChildSystemPrompt(task: string, resultFormat?: string): string {
     `## Task`,
     task,
   ];
+  if (rolePrompt) parts.push('', '## Role', rolePrompt);
   if (resultFormat) {
     parts.push('', `## Expected Output Format`, resultFormat);
   }
@@ -90,40 +97,6 @@ type SendEvent = (event: ServerEvent) => void;
 type PermissionHandler = (toolName: string, toolInput: unknown) => Promise<'allow' | 'deny'>;
 
 /**
- * Publish a failed terminal event + persist a failed run for the quick-fail
- * paths (e.g. model resolution) that return before entering the main execution
- * flow. Without this the card would stay 'running' forever.
- */
-function emitSubagentFailure(
-  sendEvent: SendEvent,
-  recordRun: SubagentRunRecorder | undefined,
-  parentSessionId: string,
-  subagentId: string,
-  task: string,
-  message: string,
-  startTime: number
-): void {
-  const truncated = message.slice(0, 200);
-  safeSendEvent(
-    sendEvent,
-    buildProgressEvent(parentSessionId, subagentId, {
-      event: 'failed',
-      error: truncated,
-    })
-  );
-  recordRun?.({
-    subagentId,
-    sessionId: parentSessionId,
-    task,
-    status: 'failed',
-    tools: [],
-    accumulatedText: '',
-    error: truncated,
-    durationMs: Date.now() - startTime,
-  });
-}
-
-/**
  * Callback for persisting a subagent run's lifecycle snapshot. Invoked once on
  * start-ish (status 'running') and once more at completion/failure with the
  * accumulated tools timeline and full text. Wired up in `src/main/index.ts` to
@@ -151,9 +124,15 @@ function createSpawnSubagentTool(
   parentSessionId: string,
   requestPermission: PermissionHandler | null,
   getParentAbortSignal: (parentSessionId: string) => AbortSignal | null,
-  concurrencyState: { active: number },
+  activeSubagents: Map<string, Set<string>>,
+  cwd: string,
+  sandboxIsolated: boolean,
   recordRun?: SubagentRunRecorder
 ): AgentRuntimeCustomTool {
+  const config = configStore.getAll();
+  const settings = config.subagentConfigError
+    ? undefined
+    : normalizeSubagentConfig(config.subagent);
   return {
     name: 'spawn_subagent',
     label: 'spawn_subagent',
@@ -167,6 +146,17 @@ function createSpawnSubagentTool(
           'A clear, self-contained description of what the child agent should accomplish. ' +
           'Include all necessary context since the child has no access to your conversation.',
       }),
+      model: Type.Optional(
+        Type.String({
+          description:
+            'Child model ID on the active API provider. Overrides the selected preset and default child model.',
+        })
+      ),
+      agent: Type.Optional(
+        Type.String({
+          description: `Named role preset. Available: ${settings?.presets.map((preset) => preset.name).join(', ') || 'none'}. Default: ${settings?.defaultAgent || 'general'}.`,
+        })
+      ),
       result_format: Type.Optional(
         Type.String({
           description:
@@ -176,7 +166,7 @@ function createSpawnSubagentTool(
       allowed_tools: Type.Optional(
         Type.Array(Type.String(), {
           description:
-            'Restrict MCP tools available to the child. Standard coding tools (read, write, edit, bash) are always available. If omitted, the child inherits all parent MCP tools.',
+            'Restrict the child coding and MCP tools by name. Intersects the role preset restrictions. An empty list disables all tools; omitted inherits the preset tools.',
         })
       ),
       timeout_seconds: Type.Optional(
@@ -188,7 +178,7 @@ function createSpawnSubagentTool(
       ),
     }),
     async execute(_toolCallId: string, params: unknown) {
-      const { task, result_format, allowed_tools, timeout_seconds } = (params ||
+      const { task, model, agent, result_format, allowed_tools, timeout_seconds } = (params ||
         {}) as SubagentParams;
 
       if (!task || typeof task !== 'string' || task.trim().length === 0) {
@@ -211,12 +201,44 @@ function createSpawnSubagentTool(
       }
 
       // Concurrency guard
-      if (concurrencyState.active >= MAX_CONCURRENT_SUBAGENTS) {
+      const config = configStore.getAll();
+      if (sandboxIsolated || config.subagentConfigError) {
+        if (config.subagentConfigError) {
+          logError(
+            '[SubagentExtension] Invalid subagent configuration:',
+            config.subagentConfigError
+          );
+        }
         return {
           content: [
             {
               type: 'text' as const,
-              text: `Error: maximum concurrent subagents (${MAX_CONCURRENT_SUBAGENTS}) reached. Wait for a running subagent to complete.`,
+              text: sandboxIsolated
+                ? 'Subagents are unavailable in sandbox sessions until child tools support sandbox isolation.'
+                : 'Subagent configuration error. Repair it in Settings > Subagents.',
+            },
+          ],
+          details: undefined,
+        };
+      }
+      const childConfig = normalizeSubagentConfig(config.subagent);
+      const agentName = agent ?? childConfig.defaultAgent;
+      const preset = childConfig.presets.find((candidate) => candidate.name === agentName);
+      if (agentName && !preset) {
+        return {
+          content: [
+            { type: 'text' as const, text: `Error: unknown subagent preset: ${agentName}` },
+          ],
+          details: undefined,
+        };
+      }
+      const active = activeSubagents.get(parentSessionId) ?? new Set<string>();
+      if (active.size >= childConfig.maxConcurrent) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error: maximum concurrent subagents (${childConfig.maxConcurrent}) reached. Wait for a running subagent to complete.`,
             },
           ],
           details: undefined as unknown,
@@ -255,7 +277,8 @@ function createSpawnSubagentTool(
         isError?: boolean;
       }> = [];
 
-      concurrencyState.active++;
+      active.add(subagentId);
+      activeSubagents.set(parentSessionId, active);
 
       safeSendEvent(
         sendEvent,
@@ -275,54 +298,81 @@ function createSpawnSubagentTool(
       });
 
       try {
-        const config = configStore.getAll();
         const authStorage = getSharedAuthStorage();
         const modelRegistry = new ModelRegistry(authStorage);
 
-        const modelString = config.model?.trim() || 'anthropic/claude-sonnet-4-6';
+        const selectedModel = model?.trim() || preset?.model || childConfig.model || config.model;
         const configProtocol = resolvePiRouteProtocol(config.provider, config.customProtocol);
-        // Normalize base URL the same way the parent runner does (registry lookup
-        // + synthetic fallback) so subagents resolve models exactly like parents.
-        const rawBaseUrl = config.baseUrl?.trim() || undefined;
-        const effectiveBaseUrl =
-          configProtocol === 'openai' && config.provider !== 'ollama'
-            ? normalizeOpenAICompatibleBaseUrl(rawBaseUrl) || rawBaseUrl
-            : rawBaseUrl;
-        let piModel = resolvePiRegistryModel(modelString, {
-          configProvider: configProtocol,
-          customBaseUrl: effectiveBaseUrl,
-          rawProvider: config.provider,
+        const registryProvider = configProtocol === 'gemini' ? 'google' : configProtocol;
+        const acceptsVendorIds =
+          config.provider === 'custom' ||
+          config.provider === 'openrouter' ||
+          config.provider === 'ollama' ||
+          (config.provider === 'openai' &&
+            !!config.baseUrl &&
+            !isOfficialOpenAIBaseUrl(config.baseUrl));
+        if (!acceptsVendorIds && selectedModel.includes('/')) {
+          const prefix = selectedModel.split('/')[0];
+          if (prefix !== config.provider && prefix !== registryProvider) {
+            throw new Error(`Child model must use the active provider (${config.provider}).`);
+          }
+        }
+        const modelString = resolvePiModelString({
+          provider: config.provider,
           customProtocol: config.customProtocol,
+          model: acceptsVendorIds
+            ? selectedModel
+            : `${registryProvider}/${selectedModel.replace(/^[^/]+\//, '')}`,
         });
-        if (!piModel) {
-          piModel = buildSyntheticPiModelFromRuntimeConfig(config, {
-            resolvedModelString: modelString,
-            routeProtocol: configProtocol,
-            effectiveBaseUrl,
-          });
-        }
-        if (!piModel) {
-          // Mirrored early-return path, but publish a failed terminal event +
-          // persisted failed run so the UI card does not spin forever.
-          emitSubagentFailure(
-            sendEvent,
-            recordRun,
-            parentSessionId,
-            subagentId,
-            task,
-            'could not resolve model for subagent',
-            startTime
+        const effectiveBaseUrl =
+          configProtocol === 'openai'
+            ? normalizeOpenAICompatibleBaseUrl(config.baseUrl) || config.baseUrl
+            : config.baseUrl;
+        let piModel =
+          resolvePiRegistryModel(modelString, {
+            configProvider: registryProvider,
+            customBaseUrl: effectiveBaseUrl,
+            rawProvider: config.provider,
+            customProtocol: config.customProtocol,
+            restrictToProvider: !acceptsVendorIds,
+          }) ??
+          buildSyntheticPiModelFromRuntimeConfig(
+            {
+              ...config,
+              model: selectedModel,
+              contextWindow: selectedModel === config.model ? config.contextWindow : undefined,
+              maxTokens: selectedModel === config.model ? config.maxTokens : undefined,
+            },
+            { resolvedModelString: modelString, routeProtocol: configProtocol, effectiveBaseUrl }
           );
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: 'Error: could not resolve model for subagent. Check provider/model config.',
-              },
-            ],
-            details: undefined as unknown,
-          };
+        if (acceptsVendorIds) {
+          const routedModel = buildSyntheticPiModelFromRuntimeConfig(
+            {
+              ...config,
+              model: selectedModel,
+              contextWindow: selectedModel === config.model ? config.contextWindow : undefined,
+              maxTokens: selectedModel === config.model ? config.maxTokens : undefined,
+            },
+            { resolvedModelString: modelString, routeProtocol: configProtocol, effectiveBaseUrl }
+          );
+          piModel = applyPiModelRuntimeOverrides(
+            {
+              ...piModel,
+              id: selectedModel,
+              provider: config.provider === 'custom' ? configProtocol : config.provider,
+              api: routedModel.api,
+              baseUrl: routedModel.baseUrl,
+            },
+            {
+              configProvider: registryProvider,
+              rawProvider: config.provider,
+              customBaseUrl: effectiveBaseUrl,
+              customProtocol: config.customProtocol,
+            }
+          );
         }
+        const apiKey = config.apiKey?.trim();
+        if (apiKey) authStorage.setRuntimeApiKey(piModel.provider, apiKey);
 
         // Build MCP tools (minus spawn_subagent)
         let mcpCustomTools: ToolDefinition[] = [];
@@ -353,18 +403,41 @@ function createSpawnSubagentTool(
           });
         }
 
-        if (allowed_tools && allowed_tools.length > 0) {
-          const allowSet = new Set(allowed_tools);
-          mcpCustomTools = mcpCustomTools.filter((t) => allowSet.has(t.name));
-        }
+        // A call can narrow a role's capabilities, never widen them.
+        const isAllowed = (name: string) =>
+          (!preset?.allowedTools || preset.allowedTools.includes(name)) &&
+          (!allowed_tools || allowed_tools.includes(name));
+        mcpCustomTools = mcpCustomTools.filter(
+          (tool) => isAllowed(tool.name) && tool.name !== 'spawn_subagent'
+        );
+        const codingTools = wrapReadToolForImageResizeErrors(
+          [
+            ...new Map(
+              [...createCodingTools(cwd), ...createReadOnlyTools(cwd)].map((tool) => [
+                tool.name,
+                tool,
+              ])
+            ).values(),
+          ].filter((tool) => isAllowed(tool.name))
+        );
 
-        const cwd = config.defaultWorkdir || process.cwd();
-        const codingTools = createCodingTools(cwd);
-
-        const childSystemPrompt = buildChildSystemPrompt(task, result_format);
+        const childSystemPrompt = buildChildSystemPrompt(task, result_format, preset?.prompt);
         const resourceLoader = new DefaultResourceLoader({
           cwd,
           appendSystemPrompt: childSystemPrompt,
+          noExtensions: true,
+          extensionFactories: requestPermission
+            ? [
+                (pi) => {
+                  pi.on('tool_call', async (event) => {
+                    const decision = await requestPermission(event.toolName, event.input);
+                    if (decision === 'deny') {
+                      return { block: true, reason: 'Permission denied by parent session policy' };
+                    }
+                  });
+                },
+              ]
+            : [],
         });
         await resourceLoader.reload();
 
@@ -383,42 +456,7 @@ function createSpawnSubagentTool(
           cwd,
         });
 
-        // Install permission gating on child session (mirrors parent behavior)
-        if (requestPermission) {
-          const piSession = childSession as unknown as {
-            setBeforeToolCall?: (
-              hook: (call: {
-                toolName: string;
-                args: unknown;
-              }) => Promise<{ block: boolean; reason?: string } | void>
-            ) => void;
-          };
-          if (typeof piSession.setBeforeToolCall === 'function') {
-            piSession.setBeforeToolCall(async (call) => {
-              const decision = await requestPermission(call.toolName, call.args);
-              if (decision === 'deny') {
-                return { block: true, reason: 'Permission denied by parent session policy' };
-              }
-              return undefined;
-            });
-          }
-        }
-
         const unsubscribe = childSession.subscribe((event) => {
-          if (event.type === 'agent_end') {
-            const messages = (event as { messages?: unknown[] }).messages || [];
-            for (let i = messages.length - 1; i >= 0; i--) {
-              const msg = messages[i] as { role?: string; content?: unknown } | undefined;
-              if (msg && msg.role === 'assistant' && Array.isArray(msg.content)) {
-                finalText = (msg.content as Array<{ type: string; text?: string }>)
-                  .filter((b) => b.type === 'text' && b.text)
-                  .map((b) => b.text)
-                  .join('');
-                break;
-              }
-            }
-          }
-
           if (event.type === 'tool_execution_start') {
             const toolName = (event as { toolName?: string }).toolName || 'unknown';
             toolsTimeline.push({ toolName, startedAt: Date.now() });
@@ -513,6 +551,21 @@ function createSpawnSubagentTool(
           if (parentAbortPromise) racers.push(parentAbortPromise);
 
           await Promise.race(racers);
+          // prompt() can finish before queued subscription events reach listeners.
+          const finalMessage = [...childSession.messages]
+            .reverse()
+            .find((message) => message.role === 'assistant');
+          if (finalMessage?.role === 'assistant') {
+            if (finalMessage.stopReason === 'error' || finalMessage.stopReason === 'aborted') {
+              throw new Error(
+                finalMessage.errorMessage || `Subagent response ${finalMessage.stopReason}`
+              );
+            }
+            finalText = finalMessage.content
+              .filter((block) => block.type === 'text')
+              .map((block) => block.text)
+              .join('');
+          }
         } finally {
           if (timeoutId) clearTimeout(timeoutId);
           if (parentAbortHandler && parentSignal) {
@@ -652,7 +705,8 @@ function createSpawnSubagentTool(
           details: undefined as unknown,
         };
       } finally {
-        concurrencyState.active--;
+        active.delete(subagentId);
+        if (active.size === 0) activeSubagents.delete(parentSessionId);
       }
     },
   };
@@ -660,7 +714,7 @@ function createSpawnSubagentTool(
 
 export class SubagentExtension implements AgentRuntimeExtension {
   readonly name = 'subagent';
-  private concurrencyState = { active: 0 };
+  private activeSubagents = new Map<string, Set<string>>();
 
   constructor(
     private readonly getMcpManager: () => MCPManager | null,
@@ -680,7 +734,9 @@ export class SubagentExtension implements AgentRuntimeExtension {
           context.session.id,
           this.requestPermission,
           this.getParentAbortSignal,
-          this.concurrencyState,
+          this.activeSubagents,
+          context.session.cwd || configStore.getAll()?.defaultWorkdir || process.cwd(),
+          context.sandboxIsolated ?? false,
           this.recordRun
         ),
       ],
